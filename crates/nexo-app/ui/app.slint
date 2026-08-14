@@ -1,0 +1,329 @@
+import { Button, ComboBox, HorizontalBox, LineEdit, ScrollView, VerticalBox } from "std-widgets.slint";
+
+export struct CommunityRow {
+    id: string,
+    name: string,
+    initial: string,
+}
+
+export struct MessageRow {
+    author: string,
+    body: string,
+    time: string,
+    mine: bool,
+}
+
+export struct ParticipantRow {
+    peer_id: string,
+    short_id: string,
+    connected: bool,
+}
+
+export component AppWindow inherits Window {
+    title: "Nexo";
+    width: 1120px;
+    height: 720px;
+    background: #101417;
+
+    in-out property <string> status-text: "Procurando pessoas na rede local";
+    in-out property <string> peer-id: "Inicializando identidade";
+    in-out property <string> invite-code: "";
+    in-out property <string> active-community: "";
+    in-out property <bool> has-community: false;
+    in-out property <bool> call-active: false;
+    in-out property <bool> call-muted: false;
+    in-out property <string> call-status: "Fora da voz";
+    in-out property <[string]> input-device-names: [];
+    in-out property <[string]> output-device-names: [];
+    in-out property <string> selected-input-device: "";
+    in-out property <string> selected-output-device: "";
+    in-out property <[ParticipantRow]> participants: [];
+    in-out property <[CommunityRow]> communities: [];
+    in-out property <[MessageRow]> messages: [];
+
+    callback create-network(string);
+    callback join-network(string);
+    callback select-community(string);
+    callback send-message(string) -> bool;
+    callback join-call();
+    callback set-muted(bool);
+    callback leave-call();
+    callback select-input-device(string);
+    callback select-output-device(string);
+
+    HorizontalBox {
+        spacing: 0px;
+
+        Rectangle {
+            width: 72px;
+            background: #161c20;
+            VerticalBox {
+                padding: 12px;
+                spacing: 10px;
+                Rectangle {
+                    height: 48px;
+                    border-radius: 8px;
+                    background: #39d98a;
+                    Text {
+                        text: "N";
+                        color: #07140e;
+                        font-size: 24px;
+                        font-weight: 800;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                Rectangle { height: 1px; background: #2b3439; }
+                for community in root.communities : Rectangle {
+                    height: 44px;
+                    border-radius: 8px;
+                    background: #253038;
+                    Text {
+                        text: community.initial;
+                        color: #dce6e9;
+                        font-size: 17px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    TouchArea { clicked => { root.select-community(community.id); } }
+                }
+                Rectangle { vertical-stretch: 1; }
+                Rectangle {
+                    height: 38px;
+                    border-radius: 8px;
+                    background: #222a2f;
+                    Text {
+                        text: "R";
+                        color: #e5ecef;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            width: 260px;
+            background: #1b2227;
+            VerticalBox {
+                padding: 18px;
+                spacing: 12px;
+                Text { text: "NEXO"; color: #f0f5f7; font-size: 18px; font-weight: 800; }
+                Text { text: root.active-community == "" ? "COMUNIDADES" : root.active-community; color: #82929a; font-size: 11px; }
+
+                if root.has-community : Rectangle {
+                    height: 42px;
+                    border-radius: 6px;
+                    background: #263138;
+                    Text { x: 12px; text: "#  geral"; color: #e3ecef; vertical-alignment: center; }
+                }
+
+                if root.has-community : Rectangle {
+                    height: root.call-active ? 210px : 54px;
+                    border-radius: 6px;
+                    background: root.call-active ? #193328 : #222c31;
+                    VerticalBox {
+                        padding: 8px;
+                        spacing: 5px;
+                        HorizontalBox {
+                            Text {
+                                text: "Voz  geral";
+                                color: #e3ecef;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            Text {
+                                text: root.call-active ? "CONECTADO" : "";
+                                color: #59d99b;
+                                font-size: 9px;
+                                vertical-alignment: center;
+                            }
+                        }
+                        if !root.call-active : Button {
+                            text: "Entrar na voz";
+                            clicked => { root.join-call(); }
+                        }
+                        if root.call-active : HorizontalBox {
+                            spacing: 6px;
+                            Button {
+                                text: root.call-muted ? "Ativar microfone" : "Silenciar";
+                                clicked => { root.set-muted(!root.call-muted); }
+                            }
+                            Button {
+                                text: "Sair";
+                                clicked => { root.leave-call(); }
+                            }
+                        }
+                        if root.call-active : Text {
+                            text: root.call-status;
+                            color: #9fb2aa;
+                            font-size: 10px;
+                        }
+                        for participant in root.participants : Rectangle {
+                            height: 16px;
+                            HorizontalBox {
+                                Text { text: participant.short-id; color: #9fb2aa; font-size: 10px; }
+                                Rectangle { horizontal-stretch: 1; }
+                                Text {
+                                    text: participant.connected ? "na voz" : "conectando";
+                                    color: participant.connected ? #59d99b : #c9a25a;
+                                    font-size: 9px;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if root.has-community : Rectangle {
+                    height: 150px;
+                    border-radius: 6px;
+                    background: #222c31;
+                    VerticalBox {
+                        padding: 8px;
+                        spacing: 5px;
+                        Text { text: "MICROFONE"; color: #7f9099; font-size: 10px; }
+                        ComboBox {
+                            model: root.input-device-names;
+                            selected(name) => {
+                                root.select-input-device(name);
+                            }
+                        }
+                        Text { text: "ALTO-FALANTE"; color: #7f9099; font-size: 10px; }
+                        ComboBox {
+                            model: root.output-device-names;
+                            selected(name) => {
+                                root.select-output-device(name);
+                            }
+                        }
+                        Text {
+                            text: root.call-active ? "Ativo: " + root.selected-input-device + " / " + root.selected-output-device : "";
+                            color: #7f9099;
+                            font-size: 10px;
+                        }
+                    }
+                }
+
+                if !root.has-community : Text {
+                    text: "Crie ou entre em uma comunidade para comecar.";
+                    color: #94a2a9;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+
+                Rectangle { vertical-stretch: 1; }
+                Text { text: "CRIAR COMUNIDADE"; color: #7f9099; font-size: 10px; }
+                network-name := LineEdit { placeholder-text: "Nome"; }
+                Button {
+                    text: "Criar e gerar convite";
+                    enabled: network-name.text != "";
+                    clicked => { root.create-network(network-name.text); network-name.text = ""; }
+                }
+                if root.invite-code != "" : Text {
+                    text: "CONVITE GERADO";
+                    color: #5fcf9a;
+                    font-size: 10px;
+                }
+                if root.invite-code != "" : LineEdit {
+                    text: root.invite-code;
+                    read-only: true;
+                }
+                Text { text: "ENTRAR COM CONVITE"; color: #7f9099; font-size: 10px; }
+                invite := LineEdit { placeholder-text: "NEXO1..."; }
+                Button {
+                    text: "Entrar";
+                    enabled: invite.text != "";
+                    clicked => { root.join-network(invite.text); }
+                }
+                Rectangle { height: 1px; background: #303a40; }
+                Text { text: root.peer-id; color: #839198; font-size: 10px; wrap: word-wrap; }
+            }
+        }
+
+        Rectangle {
+            background: #11171a;
+            VerticalBox {
+                spacing: 0px;
+                Rectangle {
+                    height: 62px;
+                    background: #151c20;
+                    HorizontalBox {
+                        padding-left: 22px;
+                        padding-right: 22px;
+                        spacing: 12px;
+                        Text {
+                            text: root.has-community ? "# geral" : "Inicio";
+                            color: #eef4f5;
+                            font-size: 17px;
+                            font-weight: 650;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        Rectangle { width: 9px; height: 9px; border-radius: 5px; background: #39d98a; }
+                        Text { text: root.status-text; color: #91a2a9; font-size: 11px; vertical-alignment: center; }
+                    }
+                    Rectangle { y: parent.height - 1px; height: 1px; background: #273137; }
+                }
+
+                if root.has-community : VerticalBox {
+                    padding: 22px;
+                    spacing: 12px;
+                    ScrollView {
+                        vertical-stretch: 1;
+                        VerticalBox {
+                            spacing: 12px;
+                            if root.messages.length == 0 : Text {
+                                text: "Este e o inicio do canal #geral.";
+                                color: #7f9099;
+                                font-size: 13px;
+                            }
+                            for message in root.messages : Rectangle {
+                                height: 64px;
+                                background: message.mine ? #17251f : #151c20;
+                                border-radius: 6px;
+                                VerticalBox {
+                                    padding: 9px;
+                                    spacing: 3px;
+                                    HorizontalBox {
+                                        Text { text: message.author; color: message.mine ? #5fe0a2 : #80bfff; font-size: 12px; font-weight: 650; }
+                                        Text { text: message.time; color: #65747b; font-size: 10px; }
+                                    }
+                                    Text { text: message.body; color: #d7e0e3; font-size: 13px; wrap: word-wrap; }
+                                }
+                            }
+                        }
+                    }
+                    HorizontalBox {
+                        height: 42px;
+                        spacing: 8px;
+                        composer := LineEdit { horizontal-stretch: 1; placeholder-text: "Mensagem para #geral"; }
+                        Button {
+                            text: "Enviar";
+                            enabled: composer.text != "";
+                            clicked => {
+                                if (root.send-message(composer.text)) {
+                                    composer.text = "";
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !root.has-community : Rectangle {
+                    VerticalBox {
+                        alignment: center;
+                        spacing: 10px;
+                        Text { text: "Sua rede, sem dono"; color: #f2f7f8; font-size: 30px; font-weight: 700; horizontal-alignment: center; }
+                        Text {
+                            text: "Crie uma comunidade ou use um convite. As mensagens ficam neste dispositivo e continuam disponiveis sem internet.";
+                            color: #9babb2;
+                            font-size: 14px;
+                            wrap: word-wrap;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

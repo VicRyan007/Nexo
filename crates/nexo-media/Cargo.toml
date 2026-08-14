@@ -1,0 +1,33 @@
+[package]
+name = "nexo-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+cpal.workspace = true
+env-libvpx-sys.workspace = true
+if-addrs.workspace = true
+rtc.workspace = true
+rusty-opus.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+webrtc.workspace = true
+uuid.workspace = true
+
+[lints.rust]
+# Workspace forbids `unsafe`; this crate is the second documented exception
+# (with nexo-video) and keeps every libvpx native call inside
+# src/video_codec.rs (see its "Safety" doc for the written design decision).
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+unwrap_used = "warn"

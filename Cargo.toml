@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nexo-core",
+    "crates/nexo-net",
+    "crates/nexo-store",
+    "crates/nexo-media",
+    "crates/nexo-video",
+    "crates/nexo-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/nexo-project/nexo"
+rust-version = "1.88"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1"
+chrono = "0.4"
+cpal = "0.18.1"
+dirs = "6"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# Raw libvpx bindings for the software VP8 codec pipeline (nexo-media). The
+# crate ships pre-generated bindings (no bindgen/libclang at build time) and
+# links a libvpx library located through the VPX_LIB_DIR / VPX_VERSION env vars
+# (see crates/nexo-media/build notes in docs/continuation.md). MPL-2.0.
+env-libvpx-sys = "5.1.0"
+futures = "0.3"
+if-addrs = "0.15"
+libp2p = { version = "0.56", features = ["cbor", "identify", "macros", "mdns", "noise", "ping", "quic", "request-response", "tcp", "tokio", "yamux"] }
+rand = "0.8"
+rusqlite = { version = "0.37", features = ["bundled"] }
+rtc = "=0.21.0-alpha.1"
+rusty-opus = "0.9.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+slint = "1"
+slint-build = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "1", features = ["serde", "v4", "v5"] }
+webrtc = "0.21.0-alpha.1"
+zeroize = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+unwrap_used = "warn"

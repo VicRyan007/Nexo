@@ -1,0 +1,64 @@
+[package]
+name = "nexo-video"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# V4L2 camera access (open/ioctl/mmap) for the Linux capture backend in
+# src/platform/linux/. All `unsafe` from these calls is isolated there.
+libc = "0.2"
+# Screen capture: XDG Desktop Portal ScreenCast handshake (ashpd) + PipeWire
+# node streaming, all in src/platform/linux/screen.rs. ashpd is async, so a
+# small tokio runtime blocks on it. x11rb (pure Rust) enumerates monitors
+# through the RandR extension on X11/XWayland sessions.
+ashpd = { version = "0.13", features = ["screencast"] }
+pipewire = "0.10"
+# Runtime::new()/block_on drive the ashpd portal handshake; zbus brings the
+# remaining tokio features (net/time/io-util/sync) transitively.
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+x11rb = { version = "0.13", features = ["randr"] }
+
+[target.'cfg(windows)'.dependencies]
+# Native video capture and probing through the official `windows` crate:
+# Media Foundation (camera enumeration, MFT encoder detection), DXGI (GPU
+# description) and AMF (AMD runtime detection). All `unsafe` from these calls is
+# isolated in src/platform/windows.rs behind safe functions.
+windows = { version = "0.62", features = [
+
+    # Windows Graphics Capture (screen capture) + Direct3D11 readback
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    # WinRT activation factories / interop for WGC items
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    # D3D11 device + staging copy + DXGI formats
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    # Monitor enumeration (EnumDisplayMonitors)
+    "Win32_Graphics_Gdi",
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+] }
+
+[lints.rust]
+# Workspace forbids `unsafe`; this crate is the documented exception and keeps
+# every native API call inside src/platform/windows.rs (see lib.rs "Safety").
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+unwrap_used = "warn"

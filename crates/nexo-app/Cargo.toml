@@ -1,0 +1,40 @@
+[package]
+name = "nexo-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+if-addrs.workspace = true
+libp2p.workspace = true
+nexo-core = { path = "../nexo-core" }
+nexo-media = { path = "../nexo-media" }
+nexo-net = { path = "../nexo-net" }
+nexo-store = { path = "../nexo-store" }
+slint.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[build-dependencies]
+slint-build.workspace = true
+
+[dev-dependencies]
+async-compat = "0.2"
+i-slint-backend-testing = "=1.17.1"
+
+[lints.rust]
+# Slint's generated component glue contains narrowly-scoped unsafe internals.
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+# Slint's generated component code uses unwrap internally.
+unwrap_used = "allow"

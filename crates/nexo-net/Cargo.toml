@@ -1,0 +1,23 @@
+[package]
+name = "nexo-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+libp2p.workspace = true
+nexo-core = { path = "../nexo-core" }
+serde.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+nexo-media = { path = "../nexo-media" }
+nexo-store = { path = "../nexo-store" }
+
+[lints]
+workspace = true
