@@ -8,9 +8,9 @@ use crate::{
     InputFrameSource, JitterBuffer, LanPeerConnection, MediaError, OutputPlayback,
     PeerConnectionError, PlayoutFrame, VoiceDecoder, VoiceEncoder,
     audio_codec::AudioCodecError,
-    video_codec::{VideoCodecError, Vp8Encoder, frame_to_i420},
+    video_codec::{VideoCodecError, Vp8Decoder, Vp8Encoder, frame_to_i420, i420_to_rgba},
 };
-use nexo_video::VideoCaptureSource;
+use nexo_video::{ScreenCaptureSource, VideoCaptureSource};
 
 const MAX_FRAMES_PER_TICK: usize = 8;
 const AUDIO_RETRY_INITIAL: Duration = Duration::from_millis(250);
@@ -19,8 +19,25 @@ const VIDEO_FRAME_DURATION: Duration = Duration::from_millis(33);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CallEngineEvent {
-    PeerConnected { peer_id: String, call_id: Uuid },
-    PeerDisconnected { peer_id: String, call_id: Uuid },
+    PeerConnected {
+        peer_id: String,
+        call_id: Uuid,
+    },
+    PeerDisconnected {
+        peer_id: String,
+        call_id: Uuid,
+    },
+    LocalVideoFrame {
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
+    RemoteVideoFrame {
+        peer_id: String,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
     AudioInputUnavailable,
     AudioInputRecovered,
     AudioOutputUnavailable,
@@ -54,6 +71,7 @@ struct PeerAudio {
     call_id: Uuid,
     connection: LanPeerConnection,
     decoder: VoiceDecoder,
+    video_decoder: Vp8Decoder,
     jitter: JitterBuffer,
     reported_connected: bool,
 }
@@ -107,9 +125,13 @@ pub struct CallEngine {
     output_recovery: EndpointRecovery,
     requested_input: Option<String>,
     requested_output: Option<String>,
+    requested_video: Option<String>,
     encoder: VoiceEncoder,
     video_encoder: Option<Vp8Encoder>,
     video_capture_source: Option<VideoCaptureSource>,
+    screen_capture_source: Option<ScreenCaptureSource>,
+    video_enabled: bool,
+    screen_sharing: bool,
     last_video_timestamp: Instant,
     peers: HashMap<String, PeerAudio>,
     muted: bool,
@@ -134,6 +156,9 @@ impl CallEngine {
         let now = Instant::now();
         let requested_input = input_id.filter(|id| !id.is_empty()).map(str::to_owned);
         let requested_output = output_id.filter(|id| !id.is_empty()).map(str::to_owned);
+        let requested_video = video_device_id
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned);
         let input = match requested_input.as_deref() {
             Some(id) => InputFrameSource::start_input(id),
             None => InputFrameSource::start_default(),
@@ -152,8 +177,8 @@ impl CallEngine {
         if output.is_none() {
             output_recovery.failed(now);
         }
-        let video_capture_source = match video_device_id {
-            Some(id) => Some(VideoCaptureSource::open(id)?),
+        let video_capture_source = match requested_video.as_deref() {
+            Some(id) => VideoCaptureSource::open(id).ok(),
             None => None,
         };
         Ok(Self {
@@ -163,9 +188,13 @@ impl CallEngine {
             output_recovery,
             requested_input,
             requested_output,
+            requested_video,
             encoder: VoiceEncoder::new()?,
             video_encoder: Some(Vp8Encoder::new(640, 480, 1_500)?),
             video_capture_source,
+            screen_capture_source: None,
+            video_enabled: true,
+            screen_sharing: false,
             last_video_timestamp: Instant::now(),
             peers: HashMap::new(),
             muted: false,
@@ -186,6 +215,7 @@ impl CallEngine {
                 call_id,
                 connection,
                 decoder: VoiceDecoder::new()?,
+                video_decoder: Vp8Decoder::new()?,
                 jitter: JitterBuffer::default(),
                 reported_connected: false,
             },
@@ -208,6 +238,7 @@ impl CallEngine {
                 call_id,
                 connection,
                 decoder: VoiceDecoder::new()?,
+                video_decoder: Vp8Decoder::new()?,
                 jitter: JitterBuffer::default(),
                 reported_connected: false,
             },
@@ -266,6 +297,48 @@ impl CallEngine {
         Ok(())
     }
 
+    /// Switches the camera to `device_id` (or disables/clears when `None`).
+    pub fn select_video(&mut self, device_id: Option<&str>) -> Result<(), CallEngineError> {
+        let requested = device_id.filter(|id| !id.is_empty()).map(str::to_owned);
+        let started = match requested.as_deref() {
+            Some(id) => VideoCaptureSource::open(id).ok(),
+            None => None,
+        };
+        self.video_capture_source = started;
+        self.requested_video = requested;
+        Ok(())
+    }
+
+    pub fn set_video_enabled(&mut self, enabled: bool) {
+        self.video_enabled = enabled;
+    }
+
+    #[must_use]
+    pub fn is_video_enabled(&self) -> bool {
+        self.video_enabled
+    }
+
+    pub fn set_screen_sharing(&mut self, enabled: bool) {
+        self.screen_sharing = enabled;
+        if enabled && self.screen_capture_source.is_none() {
+            if let Ok(monitors) = nexo_video::enumerate_monitors()
+                && let Some(primary) = monitors
+                    .iter()
+                    .find(|m| m.is_primary)
+                    .or_else(|| monitors.first())
+            {
+                self.screen_capture_source = ScreenCaptureSource::open_monitor(&primary.id).ok();
+            }
+        } else if !enabled {
+            self.screen_capture_source = None;
+        }
+    }
+
+    #[must_use]
+    pub fn is_screen_sharing(&self) -> bool {
+        self.screen_sharing
+    }
+
     #[must_use]
     pub fn current_input_id(&self) -> Option<String> {
         self.requested_input.clone()
@@ -274,6 +347,11 @@ impl CallEngine {
     #[must_use]
     pub fn current_output_id(&self) -> Option<String> {
         self.requested_output.clone()
+    }
+
+    #[must_use]
+    pub fn current_video_id(&self) -> Option<String> {
+        self.requested_video.clone()
     }
 
     #[must_use]
@@ -381,22 +459,28 @@ impl CallEngine {
 
         // Send video frames at ~30 fps (every 33 ms)
         let video_elapsed = now.duration_since(self.last_video_timestamp);
-        if video_elapsed >= VIDEO_FRAME_DURATION {
+        if video_elapsed >= VIDEO_FRAME_DURATION && (self.video_enabled || self.screen_sharing) {
             let mut i420_data = None;
             let mut frame_width = 640u32;
             let mut frame_height = 480u32;
 
-            if let Some(ref mut capture_source) = self.video_capture_source
+            if self.screen_sharing {
+                if let Some(ref mut screen_source) = self.screen_capture_source
+                    && let Ok(Some(frame)) = screen_source.read_frame()
+                {
+                    frame_width = frame.width;
+                    frame_height = frame.height;
+                    if let Ok(data) = frame_to_i420(&frame) {
+                        i420_data = Some(data);
+                    }
+                }
+            } else if let Some(ref mut capture_source) = self.video_capture_source
                 && let Ok(Some(frame)) = capture_source.read_frame()
             {
                 frame_width = frame.width;
                 frame_height = frame.height;
-                match frame_to_i420(&frame) {
-                    Ok(data) => i420_data = Some(data),
-                    Err(e) => {
-                        // Fallback to synthetic frame on conversion error
-                        eprintln!("Video frame conversion error: {e}");
-                    }
+                if let Ok(data) = frame_to_i420(&frame) {
+                    i420_data = Some(data);
                 }
             }
 
@@ -419,6 +503,14 @@ impl CallEngine {
                 synthetic
             };
 
+            if let Ok(rgba) = i420_to_rgba(&input, width, height) {
+                events.push(CallEngineEvent::LocalVideoFrame {
+                    width,
+                    height,
+                    rgba,
+                });
+            }
+
             let bitstream = self
                 .video_encoder
                 .as_mut()
@@ -433,6 +525,22 @@ impl CallEngine {
                 }
             }
             self.last_video_timestamp = now;
+        }
+
+        for (peer_id, peer) in &mut self.peers {
+            for _ in 0..MAX_FRAMES_PER_TICK {
+                let Some(packet) = peer.connection.try_received_video()? else {
+                    break;
+                };
+                if let Ok(Some(decoded)) = peer.video_decoder.decode(&packet.frame) {
+                    events.push(CallEngineEvent::RemoteVideoFrame {
+                        peer_id: peer_id.clone(),
+                        width: decoded.width,
+                        height: decoded.height,
+                        rgba: decoded.to_rgba(),
+                    });
+                }
+            }
         }
 
         for peer in self.peers.values_mut() {

@@ -38,12 +38,21 @@ pub enum CallCommand {
     Left,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CallTopologyMode {
+    Mesh,
+    ParticipantSfu,
+}
+
+pub const SFU_PARTICIPANT_THRESHOLD: usize = 5;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CallEvent {
     StartTransport { room_id: Uuid },
     StopTransport,
     PublishLocalState(ParticipantState),
     ReconnectTransport,
+    TopologyChanged(CallTopologyMode),
     StateChanged(CallState),
 }
 
@@ -86,6 +95,16 @@ impl CallSession {
         self.peers.values()
     }
 
+    #[must_use]
+    pub fn topology_mode(&self) -> CallTopologyMode {
+        let total = self.peers.len() + 1;
+        if total >= SFU_PARTICIPANT_THRESHOLD {
+            CallTopologyMode::ParticipantSfu
+        } else {
+            CallTopologyMode::Mesh
+        }
+    }
+
     pub fn apply(&mut self, command: CallCommand) -> Result<Vec<CallEvent>, MediaError> {
         match command {
             CallCommand::Join { room_id } if self.state == CallState::Idle => {
@@ -121,12 +140,24 @@ impl CallSession {
                 Ok(vec![CallEvent::PublishLocalState(self.local.clone())])
             }
             CallCommand::PeerJoined(peer) if self.state == CallState::Connected => {
+                let prev_mode = self.topology_mode();
                 self.peers.insert(peer.device_id.clone(), peer);
-                Ok(Vec::new())
+                let new_mode = self.topology_mode();
+                if new_mode == prev_mode {
+                    Ok(Vec::new())
+                } else {
+                    Ok(vec![CallEvent::TopologyChanged(new_mode)])
+                }
             }
             CallCommand::PeerLeft(device_id) if self.state != CallState::Idle => {
+                let prev_mode = self.topology_mode();
                 self.peers.remove(&device_id);
-                Ok(Vec::new())
+                let new_mode = self.topology_mode();
+                if new_mode == prev_mode {
+                    Ok(Vec::new())
+                } else {
+                    Ok(vec![CallEvent::TopologyChanged(new_mode)])
+                }
             }
             CallCommand::TransportLost if self.state == CallState::Connected => {
                 self.state = CallState::Reconnecting;
@@ -192,5 +223,58 @@ mod tests {
         };
         assert!(local.deafened);
         assert!(local.muted);
+    }
+
+    #[test]
+    fn progressive_topology_transitions_to_sfu_at_threshold() {
+        let mut call = CallSession::new("alice".into());
+        call.apply(CallCommand::Join {
+            room_id: Uuid::new_v4(),
+        })
+        .expect("join should start");
+        call.apply(CallCommand::Connected)
+            .expect("call should connect");
+        assert_eq!(call.topology_mode(), CallTopologyMode::Mesh);
+
+        // Add 3 peers (total 4 nodes: alice + 3 peers) -> still Mesh
+        for i in 1..=3 {
+            let events = call
+                .apply(CallCommand::PeerJoined(ParticipantState {
+                    device_id: format!("peer_{i}"),
+                    muted: false,
+                    deafened: false,
+                    camera_enabled: false,
+                    screen_enabled: false,
+                }))
+                .expect("peer should join");
+            assert!(events.is_empty(), "4 nodes should remain Mesh");
+            assert_eq!(call.topology_mode(), CallTopologyMode::Mesh);
+        }
+
+        // Add 4th peer (total 5 nodes: alice + 4 peers) -> transitions to ParticipantSfu!
+        let events = call
+            .apply(CallCommand::PeerJoined(ParticipantState {
+                device_id: "peer_4".into(),
+                muted: false,
+                deafened: false,
+                camera_enabled: false,
+                screen_enabled: false,
+            }))
+            .expect("peer 4 should join");
+        assert_eq!(
+            events,
+            vec![CallEvent::TopologyChanged(CallTopologyMode::ParticipantSfu)]
+        );
+        assert_eq!(call.topology_mode(), CallTopologyMode::ParticipantSfu);
+
+        // Remove a peer (drops back to 4 nodes) -> transitions back to Mesh!
+        let events = call
+            .apply(CallCommand::PeerLeft("peer_4".into()))
+            .expect("peer 4 should leave");
+        assert_eq!(
+            events,
+            vec![CallEvent::TopologyChanged(CallTopologyMode::Mesh)]
+        );
+        assert_eq!(call.topology_mode(), CallTopologyMode::Mesh);
     }
 }

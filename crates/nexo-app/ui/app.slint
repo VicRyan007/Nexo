@@ -32,6 +32,12 @@ export component AppWindow inherits Window {
     in-out property <bool> has-community: false;
     in-out property <bool> call-active: false;
     in-out property <bool> call-muted: false;
+    in-out property <bool> video-enabled: true;
+    in-out property <bool> screen-sharing: false;
+    in-out property <image> local-video;
+    in-out property <image> remote-video;
+    in-out property <bool> has-local-video: false;
+    in-out property <bool> has-remote-video: false;
     in-out property <string> call-status: "Fora da voz";
     in-out property <[string]> input-device-names: [];
     in-out property <[string]> output-device-names: [];
@@ -49,6 +55,8 @@ export component AppWindow inherits Window {
     callback send-message(string) -> bool;
     callback join-call();
     callback set-muted(bool);
+    callback toggle-video();
+    callback toggle-screen-share();
     callback leave-call();
     callback select-input-device(string);
     callback select-output-device(string);
@@ -147,15 +155,30 @@ export component AppWindow inherits Window {
                             text: "Entrar na voz";
                             clicked => { root.join-call(); }
                         }
-                        if root.call-active : HorizontalBox {
-                            spacing: 6px;
-                            Button {
-                                text: root.call-muted ? "Ativar microfone" : "Silenciar";
-                                clicked => { root.set-muted(!root.call-muted); }
+                        if root.call-active : VerticalBox {
+                            padding: 0px;
+                            spacing: 4px;
+                            HorizontalBox {
+                                spacing: 4px;
+                                Button {
+                                    text: root.call-muted ? "Desmutar" : "Silenciar";
+                                    clicked => { root.set-muted(!root.call-muted); }
+                                }
+                                Button {
+                                    text: root.video-enabled ? "Cam OFF" : "Cam ON";
+                                    clicked => { root.toggle-video(); }
+                                }
                             }
-                            Button {
-                                text: "Sair";
-                                clicked => { root.leave-call(); }
+                            HorizontalBox {
+                                spacing: 4px;
+                                Button {
+                                    text: root.screen-sharing ? "Parar Tela" : "Comp. Tela";
+                                    clicked => { root.toggle-screen-share(); }
+                                }
+                                Button {
+                                    text: "Sair";
+                                    clicked => { root.leave-call(); }
+                                }
                             }
                         }
                         if root.call-active : Text {
@@ -278,6 +301,52 @@ export component AppWindow inherits Window {
                 if root.has-community : VerticalBox {
                     padding: 22px;
                     spacing: 12px;
+
+                    if root.call-active && (root.has-remote-video || root.has-local-video) : HorizontalBox {
+                        height: 200px;
+                        spacing: 12px;
+                        if root.has-remote-video : Rectangle {
+                            horizontal-stretch: 1;
+                            background: #0d1215;
+                            border-radius: 8px;
+                            clip: true;
+                            Image {
+                                width: 100%;
+                                height: 100%;
+                                image-fit: contain;
+                                source: root.remote-video;
+                            }
+                            Text {
+                                x: 10px;
+                                y: 10px;
+                                text: "Participante Remoto";
+                                color: #82929a;
+                                font-size: 10px;
+                            }
+                        }
+                        if root.has-local-video : Rectangle {
+                            horizontal-stretch: root.has-remote-video ? 0 : 1;
+                            min-width: 180px;
+                            max-width: root.has-remote-video ? 240px : 2000px;
+                            background: #0d1215;
+                            border-radius: 8px;
+                            clip: true;
+                            Image {
+                                width: 100%;
+                                height: 100%;
+                                image-fit: contain;
+                                source: root.local-video;
+                            }
+                            Text {
+                                x: 10px;
+                                y: 10px;
+                                text: root.screen-sharing ? "Sua Tela" : "Sua Camera";
+                                color: #59d99b;
+                                font-size: 10px;
+                            }
+                        }
+                    }
+
                     ScrollView {
                         vertical-stretch: 1;
                         VerticalBox {

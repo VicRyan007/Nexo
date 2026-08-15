@@ -229,6 +229,29 @@ impl LocalStore {
         Ok(inserted == 1)
     }
 
+    /// Delete call signals recorded before `older_than_timestamp` to prevent
+    /// unbounded table growth.
+    pub fn prune_old_call_signals(&self, older_than_timestamp: u64) -> Result<usize, StoreError> {
+        let deleted = self.connection.execute(
+            "DELETE FROM call_signals_seen WHERE received_at < ?1",
+            params![to_i64(older_than_timestamp)?],
+        )?;
+        Ok(deleted)
+    }
+
+    /// Revokes authorization for `member_key` in `community_id`.
+    pub fn revoke_member(&self, community_id: Uuid, member_key: &[u8]) -> Result<bool, StoreError> {
+        let deleted_member = self.connection.execute(
+            "DELETE FROM members WHERE community_id = ?1 AND public_key = ?2",
+            params![community_id.to_string(), member_key],
+        )?;
+        self.connection.execute(
+            "DELETE FROM credentials WHERE community_id = ?1 AND member_key = ?2",
+            params![community_id.to_string(), member_key],
+        )?;
+        Ok(deleted_member > 0)
+    }
+
     pub fn save_credential(&self, credential: &CommunityCredential) -> Result<(), StoreError> {
         let credential_json = serde_json::to_string(credential)
             .map_err(|error| StoreError::InvalidData(error.to_string()))?;
@@ -1065,6 +1088,60 @@ mod tests {
             store.accept_call_signal(&outsider_signal, now),
             Err(StoreError::UnauthorizedAuthor)
         ));
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn call_signals_pruning_and_member_revocation_works() {
+        use nexo_core::{CallSignalKind, current_timestamp};
+
+        let path = std::env::temp_dir().join(format!("nexo-prune-{}.sqlite3", Uuid::new_v4()));
+        let member = DeviceIdentity::generate();
+        let community_id = Uuid::new_v4();
+        let now = current_timestamp();
+        let mut store = LocalStore::open(&path).expect("store should open");
+        store
+            .create_community(community_id, "Seguranca", now)
+            .expect("community should be created");
+        store
+            .authorize_member(community_id, &member.public_key_bytes(), now)
+            .expect("member should be authorized");
+
+        let signal = CallSignal::create(
+            &member,
+            community_id,
+            Uuid::new_v4(),
+            1,
+            CallSignalKind::Offer,
+            "v=0".into(),
+            now,
+        )
+        .expect("signal should be signed");
+
+        assert!(
+            store
+                .accept_call_signal(&signal, now)
+                .expect("signal should be accepted")
+        );
+        // Prune older than now + 10s should delete the recorded signal
+        let pruned = store
+            .prune_old_call_signals(now + 10)
+            .expect("prune should succeed");
+        assert_eq!(pruned, 1);
+
+        // Revoke member
+        assert!(
+            store
+                .revoke_member(community_id, &member.public_key_bytes())
+                .expect("revocation should succeed")
+        );
+        assert!(
+            !store
+                .is_authorized_member(community_id, &member.public_key_bytes())
+                .expect("member should not be authorized")
+        );
+
         drop(store);
         let _ = std::fs::remove_file(path);
     }

@@ -531,6 +531,91 @@ pub struct DecodedVideoFrame {
     pub uv_stride: usize,
 }
 
+impl DecodedVideoFrame {
+    /// Convert the decoded I420 frame to 32-bit RGBA pixels (`[R, G, B, A]`).
+    #[must_use]
+    #[allow(clippy::many_single_char_names)]
+    pub fn to_rgba(&self) -> Vec<u8> {
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let mut rgba = vec![0u8; width * height * 4];
+
+        for y in 0..height {
+            let y_row = y * self.y_stride;
+            let uv_row = (y / 2) * self.uv_stride;
+            let out_row = y * width * 4;
+
+            for x in 0..width {
+                let y_val = i32::from(self.y_plane[y_row + x]);
+                let u_val = i32::from(self.u_plane[uv_row + (x / 2)]);
+                let v_val = i32::from(self.v_plane[uv_row + (x / 2)]);
+
+                let c = y_val - 16;
+                let d = u_val - 128;
+                let e = v_val - 128;
+
+                let r = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
+                let g = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
+                let b = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
+
+                let idx = out_row + x * 4;
+                rgba[idx] = r;
+                rgba[idx + 1] = g;
+                rgba[idx + 2] = b;
+                rgba[idx + 3] = 255;
+            }
+        }
+        rgba
+    }
+}
+
+/// Convert tightly packed I420 bytes to 32-bit RGBA pixels (`[R, G, B, A]`).
+#[allow(clippy::many_single_char_names)]
+pub fn i420_to_rgba(i420: &[u8], width: u32, height: u32) -> Result<Vec<u8>, VideoCodecError> {
+    let w = width as usize;
+    let h = height as usize;
+    let y_size = w * h;
+    let uv_size = y_size / 4;
+    let total = y_size + uv_size * 2;
+    if i420.len() != total {
+        return Err(VideoCodecError::UnexpectedInputSize {
+            actual: i420.len(),
+            expected: total,
+        });
+    }
+    let y_plane = &i420[..y_size];
+    let u_plane = &i420[y_size..y_size + uv_size];
+    let v_plane = &i420[y_size + uv_size..];
+
+    let mut rgba = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let y_row = y * w;
+        let uv_row = (y / 2) * (w / 2);
+        let out_row = y * w * 4;
+
+        for x in 0..w {
+            let y_val = i32::from(y_plane[y_row + x]);
+            let u_val = i32::from(u_plane[uv_row + (x / 2)]);
+            let v_val = i32::from(v_plane[uv_row + (x / 2)]);
+
+            let c = y_val - 16;
+            let d = u_val - 128;
+            let e = v_val - 128;
+
+            let r = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
+            let g = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
+            let b = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
+
+            let idx = out_row + x * 4;
+            rgba[idx] = r;
+            rgba[idx + 1] = g;
+            rgba[idx + 2] = b;
+            rgba[idx + 3] = 255;
+        }
+    }
+    Ok(rgba)
+}
+
 /// Software VP8 decoder backed by a libvpx decoder context.
 pub struct Vp8Decoder {
     ctx: vpx_codec_ctx_t,
@@ -755,5 +840,13 @@ mod tests {
             encoder.encode_frame(Duration::ZERO, &too_small),
             Err(VideoCodecError::UnexpectedInputSize { .. })
         ));
+    }
+
+    #[test]
+    fn decoded_frame_to_rgba_produces_valid_buffer() {
+        let input = i420_frame(640, 480);
+        let rgba = i420_to_rgba(&input, 640, 480).expect("conversion should succeed");
+        assert_eq!(rgba.len(), 640 * 480 * 4);
+        assert_eq!(rgba[3], 255); // Alpha should be 255
     }
 }

@@ -56,6 +56,7 @@ impl Drop for AppInstance {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 struct AppState {
     identity: DeviceIdentity,
     store: LocalStore,
@@ -71,6 +72,8 @@ struct AppState {
     selected_input: Option<String>,
     selected_output: Option<String>,
     selected_video: Option<String>,
+    video_enabled: bool,
+    screen_sharing: bool,
     participants: Arc<Mutex<Vec<nexo_media::ParticipantStatus>>>,
 }
 
@@ -86,6 +89,8 @@ enum CallCommand {
     SelectOutput(String),
     SelectVideo(String),
     SetMuted(bool),
+    SetVideoEnabled(bool),
+    SetScreenSharing(bool),
     Leave,
 }
 
@@ -128,6 +133,8 @@ pub fn start_app(data_dir: &Path) -> Result<AppInstance> {
         selected_input,
         selected_output,
         selected_video,
+        video_enabled: true,
+        screen_sharing: false,
         participants: Arc::clone(&participants),
     }));
 
@@ -347,6 +354,44 @@ fn bind_call_actions(app: &AppWindow, state: &Rc<RefCell<AppState>>) {
             );
         }
         state.selected_video = id;
+    });
+
+    let weak = app.as_weak();
+    let action_state = Rc::clone(state);
+    app.on_toggle_video(move || {
+        let mut state = action_state.borrow_mut();
+        state.video_enabled = !state.video_enabled;
+        let enabled = state.video_enabled;
+        if state
+            .call_queue
+            .send(CallCommand::SetVideoEnabled(enabled))
+            .is_ok()
+            && let Some(app) = weak.upgrade()
+        {
+            app.set_video_enabled(enabled);
+            if !enabled {
+                app.set_has_local_video(false);
+            }
+        }
+    });
+
+    let weak = app.as_weak();
+    let action_state = Rc::clone(state);
+    app.on_toggle_screen_share(move || {
+        let mut state = action_state.borrow_mut();
+        state.screen_sharing = !state.screen_sharing;
+        let sharing = state.screen_sharing;
+        if state
+            .call_queue
+            .send(CallCommand::SetScreenSharing(sharing))
+            .is_ok()
+            && let Some(app) = weak.upgrade()
+        {
+            app.set_screen_sharing(sharing);
+            if !sharing && !state.video_enabled {
+                app.set_has_local_video(false);
+            }
+        }
     });
 }
 
@@ -718,11 +763,23 @@ fn start_discovery(
                                 *shared = states;
                             }
                             match engine.tick().await {
-                                Ok(events) if !events.is_empty() => {
-                                    update_call_status(&app, call_engine_status(&events, engine));
+                                Ok(events) => {
+                                    for event in &events {
+                                        match event {
+                                            CallEngineEvent::LocalVideoFrame { width, height, rgba } => {
+                                                update_local_video(&app, *width, *height, rgba.clone());
+                                            }
+                                            CallEngineEvent::RemoteVideoFrame { width, height, rgba, .. } => {
+                                                update_remote_video(&app, *width, *height, rgba.clone());
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    if !events.is_empty() {
+                                        update_call_status(&app, call_engine_status(&events, engine));
+                                    }
                                 }
-                                Ok(_) => {}
-                                Err(error) => update_call_status(&app, format!("Falha no audio: {error}")),
+                                Err(error) => update_call_status(&app, format!("Falha no audio/video: {error}")),
                             }
                         } else if let Ok(mut shared) = participants.lock() {
                             shared.clear();
@@ -884,6 +941,32 @@ fn call_engine_status(events: &[CallEngineEvent], engine: &CallEngine) -> String
     format!("{} pessoa(s) conectada(s)", engine.connected_peer_count())
 }
 
+fn update_local_video(app: &slint::Weak<AppWindow>, width: u32, height: u32, rgba: Vec<u8>) {
+    let app = app.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(width, height);
+        buffer.make_mut_bytes().copy_from_slice(&rgba);
+        let image = slint::Image::from_rgba8(buffer);
+        if let Some(app) = app.upgrade() {
+            app.set_local_video(image);
+            app.set_has_local_video(true);
+        }
+    });
+}
+
+fn update_remote_video(app: &slint::Weak<AppWindow>, width: u32, height: u32, rgba: Vec<u8>) {
+    let app = app.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(width, height);
+        buffer.make_mut_bytes().copy_from_slice(&rgba);
+        let image = slint::Image::from_rgba8(buffer);
+        if let Some(app) = app.upgrade() {
+            app.set_remote_video(image);
+            app.set_has_remote_video(true);
+        }
+    });
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn handle_call_command(
     command: CallCommand,
@@ -930,13 +1013,12 @@ async fn handle_call_command(
                     )
                     .await;
                     if let Err(error) = result {
-                        update_call_status(app, format!("Falha ao anunciar voz: {error}"));
+                        update_call_status(app, format!("Falha ao sinalizar entrada: {error}"));
                     }
                 }
-                update_call_status(app, "Na voz, aguardando pessoas".to_owned());
+                update_call_status(app, "Aguardando outros participantes".to_owned());
             }
             Err(error) => {
-                update_call_active(app, false);
                 update_call_status(app, format!("Audio indisponivel: {error}"));
             }
         },
@@ -975,8 +1057,42 @@ async fn handle_call_command(
                 }
             }
         }
-        CallCommand::SelectVideo(_device_id) => {
-            update_call_status(app, "Camera selecionada".to_owned());
+        CallCommand::SelectVideo(device_id) => {
+            if let Some(engine) = call_engine.as_mut() {
+                let id = (!device_id.is_empty()).then_some(device_id.as_str());
+                match engine.select_video(id) {
+                    Ok(()) => update_call_status(app, "Camera trocada".to_owned()),
+                    Err(error) => {
+                        update_call_status(app, format!("Falha ao trocar camera: {error}"));
+                    }
+                }
+            }
+        }
+        CallCommand::SetVideoEnabled(enabled) => {
+            if let Some(engine) = call_engine.as_mut() {
+                engine.set_video_enabled(enabled);
+                update_call_status(
+                    app,
+                    if enabled {
+                        "Camera ativada".to_owned()
+                    } else {
+                        "Camera desativada".to_owned()
+                    },
+                );
+            }
+        }
+        CallCommand::SetScreenSharing(sharing) => {
+            if let Some(engine) = call_engine.as_mut() {
+                engine.set_screen_sharing(sharing);
+                update_call_status(
+                    app,
+                    if sharing {
+                        "Compartilhando tela".to_owned()
+                    } else {
+                        "Compartilhamento de tela encerrado".to_owned()
+                    },
+                );
+            }
         }
         CallCommand::Leave => {
             if let Some((community_id, call_id)) = *active_call {
@@ -1002,6 +1118,14 @@ async fn handle_call_command(
             }
             *call_engine = None;
             *active_call = None;
+            let app_weak = app.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(app) = app_weak.upgrade() {
+                    app.set_has_local_video(false);
+                    app.set_has_remote_video(false);
+                    app.set_screen_sharing(false);
+                }
+            });
             update_call_status(app, "Fora da voz".to_owned());
         }
     }
@@ -1421,15 +1545,6 @@ fn update_call_status(app: &slint::Weak<AppWindow>, status: String) {
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(app) = app.upgrade() {
             app.set_call_status(status.into());
-        }
-    });
-}
-
-fn update_call_active(app: &slint::Weak<AppWindow>, active: bool) {
-    let app = app.clone();
-    let _ = slint::invoke_from_event_loop(move || {
-        if let Some(app) = app.upgrade() {
-            app.set_call_active(active);
         }
     });
 }

@@ -19,7 +19,9 @@ pub use devices::{
 };
 pub use engine::{CallEngine, CallEngineEvent, ParticipantStatus};
 pub use jitter::{JitterBuffer, PlayoutFrame};
-pub use session::{CallCommand, CallEvent, CallSession, CallState, MediaError, ParticipantState};
+pub use session::{
+    CallCommand, CallEvent, CallSession, CallState, CallTopologyMode, MediaError, ParticipantState,
+};
 pub use transport::{LanPeerConnection, PeerConnectionError, ReceivedAudioPacket};
 pub use video::{EncodedVideoFrame, ReceivedVideoPacket, VideoCodec};
-pub use video_codec::{DecodedVideoFrame, VideoCodecError, Vp8Decoder, Vp8Encoder};
+pub use video_codec::{DecodedVideoFrame, VideoCodecError, Vp8Decoder, Vp8Encoder, i420_to_rgba};

@@ -43,3 +43,76 @@ impl SignalResponse {
         }
     }
 }
+
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+/// Sliding window rate limiter to mitigate signaling floods / `DoS` attacks.
+#[derive(Debug)]
+pub struct SignalRateLimiter {
+    max_requests: usize,
+    window: Duration,
+    history: HashMap<[u8; 32], Vec<Instant>>,
+}
+
+impl Default for SignalRateLimiter {
+    fn default() -> Self {
+        Self::new(30, Duration::from_secs(5))
+    }
+}
+
+impl SignalRateLimiter {
+    #[must_use]
+    pub fn new(max_requests: usize, window: Duration) -> Self {
+        Self {
+            max_requests,
+            window,
+            history: HashMap::new(),
+        }
+    }
+
+    /// Check if a request from `device_key` is allowed and record the attempt.
+    pub fn check_and_record(&mut self, device_key: &[u8; 32], now: Instant) -> bool {
+        let entries = self.history.entry(*device_key).or_default();
+        entries.retain(|t| now.duration_since(*t) <= self.window);
+        if entries.len() >= self.max_requests {
+            false
+        } else {
+            entries.push(now);
+            true
+        }
+    }
+
+    /// Prunes idle device keys to avoid memory growth.
+    pub fn prune_idle(&mut self, now: Instant) {
+        self.history.retain(|_, entries| {
+            entries.retain(|t| now.duration_since(*t) <= self.window);
+            !entries.is_empty()
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limiter_bounds_bursts_and_recovers_after_window() {
+        let mut limiter = SignalRateLimiter::new(3, Duration::from_millis(100));
+        let device = [42u8; 32];
+        let now = Instant::now();
+
+        assert!(limiter.check_and_record(&device, now));
+        assert!(limiter.check_and_record(&device, now));
+        assert!(limiter.check_and_record(&device, now));
+        // 4th request in the same window must be rejected
+        assert!(!limiter.check_and_record(&device, now));
+
+        // After window expires, new requests are accepted
+        let later = now + Duration::from_millis(150);
+        assert!(limiter.check_and_record(&device, later));
+
+        limiter.prune_idle(later + Duration::from_millis(200));
+        assert!(limiter.history.is_empty());
+    }
+}

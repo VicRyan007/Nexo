@@ -312,3 +312,15 @@ all targets, and all 67 workspace tests pass on Windows GNU (`nexo-core`: 24, `n
 `nexo-store`: 7, `nexo-video`: 6, `nexo-app`: 1 two-instance integration test). Demos `capabilities` and `output_silence`
 verified live.
 
+Checkpoint 2026-08-15 (Video Rendering UI, Progressive SFU Topology, Security Hardening & Signal Rate Limiting):
+1. Slint UI Video & Screen Sharing Rendering: Updated `ui/app.slint` and `crates/nexo-app/src/lib.rs` with native video viewports
+   (local video container with camera/screen share indicator, remote participant container), sidebar toggle buttons for camera
+   and screen sharing, and event-loop RGBA8 frame rendering from `CallEngineEvent::LocalVideoFrame` and `RemoteVideoFrame`.
+2. Progressive Topology Mode: Added `CallTopologyMode::Mesh` vs `CallTopologyMode::ParticipantSfu` in `nexo-media::session` with
+   automatic dynamic transition at 5+ participants, emitting `CallEvent::TopologyChanged`.
+3. SQLite Replay Table Pruning & Revocation: Added `LocalStore::prune_old_call_signals(older_than)` and `LocalStore::revoke_member`
+   in `nexo-store`, ensuring bounded replay table retention and cryptographic access revocation with full unit test coverage.
+4. Signaling Flood Rate Limiter: Added `SignalRateLimiter` sliding-window token limiter in `nexo-net::signalling` to mitigate
+   DoS/burst spamming on authenticated peer endpoints.
+5. All 69 workspace tests pass, zero warnings under strict Clippy (`-D warnings`), and `cargo fmt --all --check` is fully clean.
+
