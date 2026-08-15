@@ -21,7 +21,7 @@ mod probe;
 mod screen;
 
 pub use capture::{PixelFormat, VideoCaptureSource, VideoFrame};
-pub use devices::{VideoDeviceInfo, enumerate_cameras};
+pub use devices::{VideoDeviceInfo, VideoError, enumerate_cameras};
 pub use probe::{
     AccelerationApi, CapabilityProbe, CapabilityReport, CaptureBackend, CodecCapability, MediaKind,
 };

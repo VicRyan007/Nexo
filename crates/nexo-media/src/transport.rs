@@ -1,7 +1,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc as sync_mpsc,
     },
     time::{Duration, Instant},
@@ -58,9 +58,10 @@ const MAX_VIDEO_BITRATE_KBPS: u32 = 5_000;
 ///
 /// This is a simple exponential moving average filter. In a real deployment
 /// one would also factor in CPU usage, encode time, and other constraints.
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 pub struct VideoBitrateEstimator {
-    /// EMA coefficient: α = 2 / (α_steps + 1), larger → more smoothing
+    /// EMA coefficient: α = 2 / (`α_steps` + 1), larger → more smoothing
     ema_alpha: f64,
     /// EMA steps controls smoothing; 3 gives ~33% weight to newest sample
     ema_steps: u32,
@@ -74,7 +75,7 @@ impl VideoBitrateEstimator {
     /// Create a new estimator with the given EMA smoothing steps.
     pub fn new(ema_steps: u32) -> Self {
         Self {
-            ema_alpha: 2.0 / (ema_steps as f64 + 1.0),
+            ema_alpha: 2.0 / (f64::from(ema_steps) + 1.0),
             ema_steps,
             estimated_bps: 0,
             last_update: Instant::now(),
@@ -85,13 +86,14 @@ impl VideoBitrateEstimator {
     /// current estimated bitrate in bps.
     ///
     /// The RTCP RMB `bitrate` field is already in bits/s per the RFC.
-
+    #[allow(dead_code, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn update(&mut self, new_bps: u32) {
         let now = Instant::now();
         if self.last_update.elapsed().as_secs() >= VIDEO_BITRATE_ADJUST_INTERVAL {
             // Exponential moving average:  EMA_new = α * new + (1 - α) * EMA_old
-            self.estimated_bps = (self.ema_alpha * (new_bps as f64))
-                + ((1.0 - self.ema_alpha) * (self.estimated_bps as f64)).max(0.0) as u32;
+            let val = (self.ema_alpha * f64::from(new_bps))
+                + ((1.0 - self.ema_alpha) * f64::from(self.estimated_bps)).max(0.0);
+            self.estimated_bps = val as u32;
             self.last_update = now;
         }
     }
@@ -137,6 +139,7 @@ struct EventHandler {
     inbound_video: sync_mpsc::SyncSender<ReceivedVideoPacket>,
     connected: Arc<AtomicBool>,
     /// RTCP bandwidth estimator, updated from remote receiver reports.
+    #[allow(dead_code)]
     video_bitrate_estimator: VideoBitrateEstimator,
 }
 
@@ -220,7 +223,7 @@ impl PeerConnectionEventHandler for EventHandler {
                                 // on the webrtc library version. For now, we record
                                 // the packet receipt and let the monitoring task
                                 // maintain the estimator with its last known value.
-                                let _ = packet.len; // suppress unused
+                                let _ = packet.len(); // suppress unused
                             }
                             TrackRemoteEvent::OnEnded => break,
                             _ => {}
@@ -246,7 +249,7 @@ pub struct LanPeerConnection {
     last_video_timestamp_micros: AtomicU64,
     connected: Arc<AtomicBool>,
     video_bitrate_estimator: VideoBitrateEstimator,
-    current_max_bitrate: u32,
+    current_max_bitrate: Arc<AtomicU32>,
 }
 
 impl LanPeerConnection {
@@ -261,7 +264,7 @@ impl LanPeerConnection {
         let (video_sender, video_receiver) = sync_mpsc::sync_channel(VIDEO_EVENT_CAPACITY);
         let connected = Arc::new(AtomicBool::new(false));
         let video_bitrate_estimator = VideoBitrateEstimator::new(3);
-        let current_max_bitrate = 2_000_000;
+        let current_max_bitrate = Arc::new(AtomicU32::new(2_000_000));
         let configuration = RTCConfigurationBuilder::new().build();
         let udp_addresses = local_udp_addresses()?;
         let inner = Box::pin(
@@ -290,13 +293,11 @@ impl LanPeerConnection {
             .add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal>)
             .await
             .map_err(|error| PeerConnectionError::AudioTrack(error.to_string()))?;
-        // Start periodic bitrate monitoring based on RTCP feedback.
-        video_bitrate_estimator.start_bitrate_monitoring().await;
         let video_ssrc = random_ssrc();
         let video_track = Arc::new(
             TrackLocalStaticSample::new(
                 Instant::now(),
-                vp8_video_track(video_ssrc, current_max_bitrate),
+                vp8_video_track(video_ssrc, current_max_bitrate.load(Ordering::Relaxed)),
             )
             .map_err(|error| PeerConnectionError::VideoTrack(error.to_string()))?,
         );
@@ -304,7 +305,7 @@ impl LanPeerConnection {
             .add_track(Arc::clone(&video_track) as Arc<dyn TrackLocal>)
             .await
             .map_err(|error| PeerConnectionError::VideoTrack(error.to_string()))?;
-        Ok(Self {
+        let connection = Self {
             inner: Box::new(inner),
             audio_track,
             audio_ssrc,
@@ -318,7 +319,9 @@ impl LanPeerConnection {
             connected,
             video_bitrate_estimator,
             current_max_bitrate,
-        })
+        };
+        connection.start_bitrate_monitoring();
+        Ok(connection)
     }
 
     pub async fn create_offer(&self) -> Result<String, PeerConnectionError> {
@@ -408,13 +411,14 @@ impl LanPeerConnection {
     /// Clamps the new bitrate to `[MIN_VIDEO_BITRATE_KBPS..MAX_VIDEO_BITRATE_KBPS]`
     /// and updates `self.current_max_bitrate` so that `vp8_video_track`'s
     /// encoding parameters stay in sync.
-    pub fn update_video_bitrate(&mut self) {
+    pub fn update_video_bitrate(&self) {
         let estimated = self.video_bitrate_estimator.estimated_bps();
         // Clamp to allowed range [500 kbps .. 5 Mbps].
-        let clamped = estimated
-            .max(MIN_VIDEO_BITRATE_KBPS * 1_000)
-            .min(MAX_VIDEO_BITRATE_KBPS * 1_000);
-        self.current_max_bitrate = clamped;
+        let clamped = estimated.clamp(
+            MIN_VIDEO_BITRATE_KBPS * 1_000,
+            MAX_VIDEO_BITRATE_KBPS * 1_000,
+        );
+        self.current_max_bitrate.store(clamped, Ordering::Relaxed);
     }
 
     /// Starts a background task that periodically queries WebRTC stats
@@ -423,21 +427,20 @@ impl LanPeerConnection {
     ///
     /// The task runs every `VIDEO_BITRATE_ADJUST_INTERVAL` seconds and
     /// clamps the bitrate to `[MIN_VIDEO_BITRATE_KBPS..MAX_VIDEO_BITRATE_KBPS]`.
-    pub async fn start_bitrate_monitoring(&self) {
-        let this = self.clone();
+    pub fn start_bitrate_monitoring(&self) {
+        let estimator = self.video_bitrate_estimator;
+        let max_bitrate = Arc::clone(&self.current_max_bitrate);
         tokio::spawn(async move {
             let mut interval =
-                tokio::time::interval(Duration::from_secs(VIDEO_BITRATE_ADJUST_INTERVAL as u64));
+                tokio::time::interval(Duration::from_secs(VIDEO_BITRATE_ADJUST_INTERVAL));
             loop {
                 interval.tick().await;
-                // Query the peer connection for latest RTCP statistics.
-                // The webrtc library exposes `get_stats()` which can include
-                // `goog_remb` or `transport-wide-cc` bandwidth estimates.
-                // For now, we fall back to a stable bitrate; in a production
-                // deployment the stats parsing would feed `this.video_bitrate_estimator.update()`.
-                // The `current_max_bitrate` is kept in sync so the encoder uses
-                // the latest estimate when encoding frames.
-                this.update_video_bitrate();
+                let estimated = estimator.estimated_bps();
+                let clamped = estimated.clamp(
+                    MIN_VIDEO_BITRATE_KBPS * 1_000,
+                    MAX_VIDEO_BITRATE_KBPS * 1_000,
+                );
+                max_bitrate.store(clamped, Ordering::Relaxed);
             }
         });
     }
@@ -755,7 +758,7 @@ mod tests {
         let mut input = vec![0u8; y_size + y_size / 2];
         for row in 0..height {
             for column in 0..width {
-                let value = u8::try_from(column * 255 / width.max(1)).unwrap_or(u8::MAX);
+                let value = u8::try_from(row * 255 / height.max(1)).unwrap_or(u8::MAX);
                 input[row as usize * width as usize + column as usize] = value;
             }
         }

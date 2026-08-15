@@ -58,15 +58,17 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::{EncodedVideoFrame, VideoCodec};
-use vpx_sys::{
-    VPX_DECODER_ABI_VERSION, VPX_DL_REALTIME, VPX_EFLAG_FORCE_KF, VPX_ENCODER_ABI_VERSION,
-    VPX_ERROR_RESILIENT_DEFAULT, VPX_FRAME_IS_KEY, vpx_codec_ctx_t, vpx_codec_cx_pkt_kind,
-    vpx_codec_dec_init_ver, vpx_codec_decode, vpx_codec_destroy, vpx_codec_enc_cfg_t,
-    vpx_codec_enc_config_default, vpx_codec_enc_init_ver, vpx_codec_encode, vpx_codec_err_t,
-    vpx_codec_error, vpx_codec_error_detail, vpx_codec_get_cx_data, vpx_codec_get_frame,
-    vpx_codec_iter_t, vpx_codec_pts_t, vpx_codec_vp8_cx, vpx_codec_vp8_dx, vpx_enc_frame_flags_t,
-    vpx_image_t, vpx_img_fmt, vpx_img_wrap, vpx_rational,
+use crate::{
+    EncodedVideoFrame, VideoCodec,
+    vpx_sys::{
+        VPX_DECODER_ABI_VERSION, VPX_DL_REALTIME, VPX_EFLAG_FORCE_KF, VPX_ENCODER_ABI_VERSION,
+        VPX_ERROR_RESILIENT_DEFAULT, VPX_FRAME_IS_KEY, vpx_codec_ctx_t, vpx_codec_cx_pkt_kind,
+        vpx_codec_dec_init_ver, vpx_codec_decode, vpx_codec_destroy, vpx_codec_enc_cfg_t,
+        vpx_codec_enc_config_default, vpx_codec_enc_init_ver, vpx_codec_encode, vpx_codec_err_t,
+        vpx_codec_error, vpx_codec_error_detail, vpx_codec_get_cx_data, vpx_codec_get_frame,
+        vpx_codec_iter_t, vpx_codec_pts_t, vpx_codec_vp8_cx, vpx_codec_vp8_dx,
+        vpx_enc_frame_flags_t, vpx_image_t, vpx_img_fmt, vpx_img_wrap, vpx_rational,
+    },
 };
 
 const VP8_CLOCK_RATE: u32 = 90_000;
@@ -128,6 +130,12 @@ fn check(
     }
 }
 
+fn timestamp_pts(timestamp: Duration) -> vpx_codec_pts_t {
+    let micros = u64::try_from(timestamp.as_micros()).unwrap_or(u64::MAX);
+    let pts = micros * u64::from(VP8_CLOCK_RATE) / 1_000_000;
+    vpx_codec_pts_t::try_from(pts).unwrap_or(vpx_codec_pts_t::MAX)
+}
+
 /// Software VP8 encoder backed by a libvpx realtime encoder context.
 ///
 /// Input is tightly-packed I420 (`width * height` luma bytes followed by
@@ -145,7 +153,7 @@ impl Vp8Encoder {
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return Err(VideoCodecError::InvalidDimensions { width, height });
         }
-        let iface = ptr::NonNull::new(unsafe { vpx_codec_vp8_cx() }).ok_or(
+        let iface = ptr::NonNull::new(unsafe { vpx_codec_vp8_cx() }.cast_mut()).ok_or(
             VideoCodecError::Unavailable {
                 component: "encoder",
             },
@@ -179,13 +187,7 @@ impl Vp8Encoder {
         let mut ctx: vpx_codec_ctx_t = unsafe { MaybeUninit::zeroed().assume_init() };
         // SAFETY: `ctx` is writable, `iface`/`cfg` are valid for the call.
         let result = unsafe {
-            vpx_codec_enc_init_ver(
-                &mut ctx,
-                iface.as_ptr(),
-                &cfg,
-                0,
-                vpx_sys::VPX_ENCODER_ABI_VERSION as c_int,
-            )
+            vpx_codec_enc_init_ver(&mut ctx, iface.as_ptr(), &cfg, 0, VPX_ENCODER_ABI_VERSION)
         };
         if result != vpx_codec_err_t::VPX_CODEC_OK {
             return Err(VideoCodecError::Codec {
@@ -235,19 +237,18 @@ impl Vp8Encoder {
                 detail: "vpx_img_wrap returned null".to_owned(),
             });
         }
-        let pts = Vp8Encoder::timestamp_pts(timestamp);
-        // On the Windows GNU target `c_long` is 32-bit; the `.into()` keeps
+        let pts = timestamp_pts(timestamp);
+        // On the Windows GNU target `c_long` is 32-bit; cast keeps
         // the call portable across libvpx's two ABI layouts.
         let flags: vpx_enc_frame_flags_t = if force_keyframe {
-            VPX_EFLAG_FORCE_KF.into()
+            VPX_EFLAG_FORCE_KF as vpx_enc_frame_flags_t
         } else {
             0
         };
         // SAFETY: `self.ctx` is an initialized encoder; `image` is valid while
         // `data` (which it aliases) is alive in this frame.
-        let result = unsafe {
-            vpx_codec_encode(&mut self.ctx, &image, pts, 1, flags, VPX_DL_REALTIME.into())
-        };
+        let result =
+            unsafe { vpx_codec_encode(&mut self.ctx, &image, pts, 1, flags, VPX_DL_REALTIME) };
         check(result, "encode the I420 frame", &self.ctx)?;
 
         let mut iter: vpx_codec_iter_t = ptr::null();
@@ -267,7 +268,8 @@ impl Vp8Encoder {
             // SAFETY: reading the `frame` member of the active union field is
             // valid because libvpx set `kind` to CX_FRAME_PKT above.
             let frame = unsafe { &packet.data.frame };
-            let size = usize::try_from(frame.sz).unwrap_or(usize::MAX);
+            #[allow(clippy::useless_conversion)]
+            let size = usize::from(frame.sz);
             let is_keyframe = frame.flags & VPX_FRAME_IS_KEY != 0;
             let mut bytes = Vec::with_capacity(size);
             if size > 0 {
@@ -456,21 +458,15 @@ impl Vp8Encoder {
 
         // U plane (half width, half height) - use mid-value as placeholder
         let u_v_stride = width as usize / 2;
-        for (i, dst) in i420[y_size..y_size + uv_size]
-            .chunks_exact_mut(u_v_stride)
-            .enumerate()
-        {
-            for (j, byte) in dst.iter_mut().enumerate() {
+        for dst in i420[y_size..y_size + uv_size].chunks_exact_mut(u_v_stride) {
+            for byte in dst.iter_mut() {
                 *byte = 128; // neutral U value
             }
         }
 
         // V plane
-        for (i, dst) in i420[y_size + uv_size..]
-            .chunks_exact_mut(u_v_stride)
-            .enumerate()
-        {
-            for (j, byte) in dst.iter_mut().enumerate() {
+        for dst in i420[y_size + uv_size..].chunks_exact_mut(u_v_stride) {
+            for byte in dst.iter_mut() {
                 *byte = 128; // neutral V value
             }
         }
@@ -478,33 +474,37 @@ impl Vp8Encoder {
         Ok(i420)
     }
 
-    /// Convert a captured VideoFrame's PixelFormat to I420 bytes.
+    /// Convert a captured [`nexo_video::VideoFrame`]'s [`nexo_video::PixelFormat`] to I420 bytes.
     ///
     /// The caller must ensure the input data has the correct size for the format.
-    pub fn frame_to_i420(frame: &crate::capture::VideoFrame) -> Result<Vec<u8>, VideoCodecError> {
+    pub fn frame_to_i420(frame: &nexo_video::VideoFrame) -> Result<Vec<u8>, VideoCodecError> {
         match frame.format {
-            crate::capture::PixelFormat::Nv12 => {
+            nexo_video::PixelFormat::Nv12 => {
                 Self::nv12_to_i420(&frame.data, frame.width, frame.height)
             }
-            crate::capture::PixelFormat::Yuy2 => {
+            nexo_video::PixelFormat::Yuy2 => {
                 Self::yuy2_to_i420(&frame.data, frame.width, frame.height)
             }
-            crate::capture::PixelFormat::Mjpg => {
+            nexo_video::PixelFormat::Mjpg => {
                 // MJPEG is compressed; needs decompression before encoding
                 Err(VideoCodecError::UnexpectedInputSize {
                     actual: 0,
                     expected: 0,
                 })
             }
-            crate::capture::PixelFormat::Bgra8 => {
+            nexo_video::PixelFormat::Bgra8 => {
                 Self::bgra_to_i420(&frame.data, frame.width, frame.height)
             }
-            crate::capture::PixelFormat::Unknown => Err(VideoCodecError::UnexpectedInputSize {
+            nexo_video::PixelFormat::Unknown => Err(VideoCodecError::UnexpectedInputSize {
                 actual: 0,
                 expected: 0,
             }),
         }
     }
+}
+
+pub fn frame_to_i420(frame: &nexo_video::VideoFrame) -> Result<Vec<u8>, VideoCodecError> {
+    Vp8Encoder::frame_to_i420(frame)
 }
 
 impl Drop for Vp8Encoder {
@@ -539,7 +539,7 @@ pub struct Vp8Decoder {
 impl Vp8Decoder {
     /// Create a VP8 decoder.
     pub fn new() -> Result<Self, VideoCodecError> {
-        let iface = ptr::NonNull::new(unsafe { vpx_codec_vp8_dx() }).ok_or(
+        let iface = ptr::NonNull::new(unsafe { vpx_codec_vp8_dx() }.cast_mut()).ok_or(
             VideoCodecError::Unavailable {
                 component: "decoder",
             },
@@ -553,7 +553,7 @@ impl Vp8Decoder {
                 iface.as_ptr(),
                 ptr::null(),
                 0,
-                vpx_sys::VPX_DECODER_ABI_VERSION as c_int,
+                VPX_DECODER_ABI_VERSION,
             )
         };
         if result != vpx_codec_err_t::VPX_CODEC_OK {
@@ -582,7 +582,7 @@ impl Vp8Decoder {
                 frame.data.as_ptr(),
                 frame.data.len() as c_uint,
                 ptr::null_mut(),
-                vpx_codec_pts_t::from(VPX_DL_REALTIME),
+                VPX_DL_REALTIME as _,
             )
         };
         check(result, "decode the VP8 frame", &self.ctx)?;
@@ -655,8 +655,8 @@ mod tests {
         let mut data = vec![0u8; y_size + y_size / 2];
         for row in 0..height {
             for column in 0..width {
-                // Horizontal gradient so compression artifacts are measurable.
-                let value = u8::try_from(column * 255 / width.max(1)).unwrap_or(u8::MAX);
+                // Vertical gradient so top vs bottom row sampling is measurable.
+                let value = u8::try_from(row * 255 / height.max(1)).unwrap_or(u8::MAX);
                 data[row as usize * width as usize + column as usize] = value;
             }
         }
@@ -735,9 +735,8 @@ mod tests {
 
     #[test]
     fn vp8_encoder_rejects_odd_dimensions() {
-        let error = match Vp8Encoder::new(641, 480, 1_000) {
-            Ok(_) => panic!("odd width must be rejected"),
-            Err(error) => error,
+        let Err(error) = Vp8Encoder::new(641, 480, 1_000) else {
+            panic!("odd width must be rejected");
         };
         assert!(matches!(
             error,

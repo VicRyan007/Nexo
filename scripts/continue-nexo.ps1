@@ -33,9 +33,14 @@ function Resolve-ContinuationAgent {
 
 function Invoke-NexoVerification {
     $previousPath = $env:PATH
+    $previousPkgConfig = $env:PKG_CONFIG_PATH
     try {
         if (Test-Path -LiteralPath $MingwPath) {
             $env:PATH = "$MingwPath;$env:USERPROFILE\.cargo\bin;$previousPath"
+            $pkgConfigDir = Join-Path (Split-Path $MingwPath -Parent) 'lib\pkgconfig'
+            if (Test-Path -LiteralPath $pkgConfigDir) {
+                $env:PKG_CONFIG_PATH = "$pkgConfigDir;$previousPkgConfig"
+            }
         }
         Push-Location $ProjectRoot
         try {
@@ -59,6 +64,7 @@ function Invoke-NexoVerification {
     }
     finally {
         $env:PATH = $previousPath
+        $env:PKG_CONFIG_PATH = $previousPkgConfig
     }
 }
 

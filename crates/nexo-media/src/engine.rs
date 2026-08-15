@@ -5,12 +5,12 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    EncodedVideoFrame, InputFrameSource, JitterBuffer, LanPeerConnection, MediaError,
-    OutputPlayback, PeerConnectionError, PlayoutFrame, VideoCodec, VoiceDecoder, VoiceEncoder,
+    InputFrameSource, JitterBuffer, LanPeerConnection, MediaError, OutputPlayback,
+    PeerConnectionError, PlayoutFrame, VoiceDecoder, VoiceEncoder,
     audio_codec::AudioCodecError,
-    capture::VideoCaptureSource,
-    video_codec::{Vp8Encoder, frame_to_i420},
+    video_codec::{VideoCodecError, Vp8Encoder, frame_to_i420},
 };
+use nexo_video::VideoCaptureSource;
 
 const MAX_FRAMES_PER_TICK: usize = 8;
 const AUDIO_RETRY_INITIAL: Duration = Duration::from_millis(250);
@@ -33,6 +33,10 @@ pub enum CallEngineError {
     Media(#[from] MediaError),
     #[error(transparent)]
     Codec(#[from] AudioCodecError),
+    #[error(transparent)]
+    CodecVideo(#[from] VideoCodecError),
+    #[error(transparent)]
+    VideoDevice(#[from] nexo_video::VideoError),
     #[error(transparent)]
     Connection(#[from] PeerConnectionError),
     #[error("there is no pending WebRTC connection for this peer and call")]
@@ -113,7 +117,7 @@ pub struct CallEngine {
 
 impl CallEngine {
     pub fn new() -> Result<Self, CallEngineError> {
-        Self::with_devices(None, None)
+        Self::with_devices(None, None, None)
     }
 
     /// Builds a call engine whose audio endpoints are the requested devices.
@@ -326,6 +330,7 @@ impl CallEngine {
         Ok(())
     }
 
+    #[allow(clippy::missing_panics_doc, clippy::too_many_lines)]
     pub async fn tick(&mut self) -> Result<Vec<CallEngineEvent>, CallEngineError> {
         let now = Instant::now();
         let mut events = Vec::new();
@@ -378,39 +383,40 @@ impl CallEngine {
         let video_elapsed = now.duration_since(self.last_video_timestamp);
         if video_elapsed >= VIDEO_FRAME_DURATION {
             let mut i420_data = None;
-            let mut frame_width = 640i32;
-            let mut frame_height = 480i32;
+            let mut frame_width = 640u32;
+            let mut frame_height = 480u32;
 
-            if let Some(ref mut capture_source) = self.video_capture_source {
-                if let Ok(Some(frame)) = capture_source.read_frame() {
-                    frame_width = frame.width as i32;
-                    frame_height = frame.height as i32;
-                    match frame_to_i420(&frame) {
-                        Ok(data) => i420_data = Some(data),
-                        Err(e) => {
-                            // Fallback to synthetic frame on conversion error
-                            eprintln!("Video frame conversion error: {}", e);
-                        }
+            if let Some(ref mut capture_source) = self.video_capture_source
+                && let Ok(Some(frame)) = capture_source.read_frame()
+            {
+                frame_width = frame.width;
+                frame_height = frame.height;
+                match frame_to_i420(&frame) {
+                    Ok(data) => i420_data = Some(data),
+                    Err(e) => {
+                        // Fallback to synthetic frame on conversion error
+                        eprintln!("Video frame conversion error: {e}");
                     }
                 }
             }
 
             let (width, height) = (frame_width.max(1), frame_height.max(1));
-            let y_size = width as usize * height as usize;
-            let mut input = match &i420_data {
-                Some(data) => data.clone(),
-                None => {
-                    // Fallback: synthetic gradient frame
-                    let mut synthetic = vec![0u8; y_size + y_size / 2];
-                    for row in 0..height {
-                        for column in 0..width {
-                            let value =
-                                u8::try_from(column * 255 / width.max(1)).unwrap_or(u8::MAX);
-                            synthetic[row as usize * width as usize + column as usize] = value;
-                        }
+            let width_usize = width as usize;
+            let height_usize = height as usize;
+            let y_size = width_usize * height_usize;
+            let input = if let Some(data) = &i420_data {
+                data.clone()
+            } else {
+                // Fallback: synthetic gradient frame
+                let mut synthetic = vec![0u8; y_size + y_size / 2];
+                for row in 0..height_usize {
+                    for column in 0..width_usize {
+                        let value =
+                            u8::try_from(column * 255 / width_usize.max(1)).unwrap_or(u8::MAX);
+                        synthetic[row * width_usize + column] = value;
                     }
-                    synthetic
                 }
+                synthetic
             };
 
             let bitstream = self

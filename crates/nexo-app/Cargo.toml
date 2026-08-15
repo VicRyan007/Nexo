@@ -17,6 +17,7 @@ nexo-core = { path = "../nexo-core" }
 nexo-media = { path = "../nexo-media" }
 nexo-net = { path = "../nexo-net" }
 nexo-store = { path = "../nexo-store" }
+nexo-video = { path = "../nexo-video" }
 slint.workspace = true
 tokio.workspace = true
 uuid.workspace = true

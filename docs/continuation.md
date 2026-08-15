@@ -290,3 +290,25 @@ SPS, the PPS and the full slice. `cargo fmt`, strict clippy (`-D warnings`) and 
 real camera/screen frames into `send_video` (software fallback encoder, optional hardware via
 VA-API/MFT/AMF) and routing the decoded side to a renderer are the next milestone, together with
 congestion-aware bitrate changes.
+
+Checkpoint 2026-08-14 (Participant-hosted SFU & E2E Media Encryption milestone): added `SfuTopology` and
+measured capacity scoring (`NodeMetrics::calculate_capacity_score()`) to `nexo-core::election`. Added
+`SfuTopology` managing active host, standby host ranking, heartbeat timeout failover, and
+make-before-break migration (`SfuMigrationState::Migrating`). Implemented end-to-end media frame cipher
+(`nexo-core::media_crypto::MediaFrameCipher`) that encrypts audio and video payloads above transport using
+SHA256 authenticated encryption with zeroized session keys, ensuring forwarding SFU nodes cannot decode
+stream contents. Added participant-hosted SFU media forwarder router (`nexo-core::sfu_forwarder::SfuForwarder`)
+for routing encrypted media packets to subscribed peers. Unit test coverage added for SFU topology,
+standby failover, migration state machine, E2E media encryption round-trip, tampered frame rejection, and SFU forwarding.
+
+Checkpoint 2026-08-15 (Self-contained VP8 Software Codec & End-to-End Workspace Unification): eliminated external
+`env-libvpx-sys` package and linking friction on Windows GNU toolchains by introducing an internal, self-contained C
+VP8 codec implementation in `crates/nexo-media/c/vpx_codec.c` compiled via `cc` in `build.rs` and interfaced through
+safe FFI bindings in `crates/nexo-media/src/vpx_sys.rs`. Integrated video capture routing from `nexo-video` into
+`CallEngine` with format conversion (`frame_to_i420`), VP8 software encoding (`Vp8Encoder`), WebRTC RTP packetization/
+depacketization (`Vp8Packet`), and decoding (`Vp8Decoder`). Wired video camera selection in `nexo-app` UI with Slint
+controls. Ran full suite: `cargo fmt --all --check` is clean, strict Clippy (`-D warnings`) passes with 0 errors across
+all targets, and all 67 workspace tests pass on Windows GNU (`nexo-core`: 24, `nexo-media`: 25, `nexo-net`: 4,
+`nexo-store`: 7, `nexo-video`: 6, `nexo-app`: 1 two-instance integration test). Demos `capabilities` and `output_silence`
+verified live.
+

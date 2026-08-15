@@ -10,7 +10,6 @@ rust-version.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 cpal.workspace = true
-env-libvpx-sys.workspace = true
 if-addrs.workspace = true
 rtc.workspace = true
 rusty-opus.workspace = true
@@ -18,7 +17,11 @@ serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 webrtc.workspace = true
+nexo-video = { path = "../nexo-video" }
 uuid.workspace = true
+
+[build-dependencies]
+cc = "1.0"
 
 [lints.rust]
 # Workspace forbids `unsafe`; this crate is the second documented exception

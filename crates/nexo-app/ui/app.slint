@@ -35,8 +35,10 @@ export component AppWindow inherits Window {
     in-out property <string> call-status: "Fora da voz";
     in-out property <[string]> input-device-names: [];
     in-out property <[string]> output-device-names: [];
+    in-out property <[string]> video-device-names: [];
     in-out property <string> selected-input-device: "";
     in-out property <string> selected-output-device: "";
+    in-out property <string> selected-video-device: "";
     in-out property <[ParticipantRow]> participants: [];
     in-out property <[CommunityRow]> communities: [];
     in-out property <[MessageRow]> messages: [];
@@ -50,6 +52,7 @@ export component AppWindow inherits Window {
     callback leave-call();
     callback select-input-device(string);
     callback select-output-device(string);
+    callback select-video-device(string);
 
     HorizontalBox {
         spacing: 0px;
@@ -176,7 +179,7 @@ export component AppWindow inherits Window {
                 }
 
                 if root.has-community : Rectangle {
-                    height: 150px;
+                    height: 210px;
                     border-radius: 6px;
                     background: #222c31;
                     VerticalBox {
@@ -196,8 +199,15 @@ export component AppWindow inherits Window {
                                 root.select-output-device(name);
                             }
                         }
+                        Text { text: "CAMERA"; color: #7f9099; font-size: 10px; }
+                        ComboBox {
+                            model: root.video-device-names;
+                            selected(name) => {
+                                root.select-video-device(name);
+                            }
+                        }
                         Text {
-                            text: root.call-active ? "Ativo: " + root.selected-input-device + " / " + root.selected-output-device : "";
+                            text: root.call-active ? "Ativo: " + root.selected-input-device + " / " + root.selected-output-device + " / " + root.selected-video-device : "";
                             color: #7f9099;
                             font-size: 10px;
                         }

@@ -109,7 +109,7 @@ async fn run_scenario() -> anyhow::Result<()> {
     )
     .await?;
 
-    // 5) Catálogo de áudio: A seleciona o primeiro dispositivo de entrada; o
+    // 5) Catálogo de áudio e vídeo: A seleciona o primeiro dispositivo de entrada e vídeo; o
     //    rótulo refletido deve corresponder ao nome dele (mapeamento nome->id).
     let input_names = app_a.window.get_input_device_names();
     if input_names.row_count() > 0 {
@@ -123,6 +123,20 @@ async fn run_scenario() -> anyhow::Result<()> {
         anyhow::ensure!(
             app_a.window.get_selected_input_device().as_str() == first,
             "rótulo do microfone deveria refletir o dispositivo selecionado"
+        );
+    }
+    let video_names = app_a.window.get_video_device_names();
+    if video_names.row_count() > 0 {
+        let first_cam = video_names
+            .row_data(0)
+            .context("primeiro dispositivo de vídeo")?
+            .to_string();
+        app_a
+            .window
+            .invoke_select_video_device(first_cam.clone().into());
+        anyhow::ensure!(
+            app_a.window.get_selected_video_device().as_str() == first_cam,
+            "rótulo da câmera deveria refletir o dispositivo selecionado"
         );
     }
 

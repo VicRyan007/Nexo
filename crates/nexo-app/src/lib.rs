@@ -67,8 +67,10 @@ struct AppState {
     call_muted: bool,
     input_devices: Vec<nexo_media::AudioDeviceInfo>,
     output_devices: Vec<nexo_media::AudioDeviceInfo>,
+    video_devices: Vec<nexo_video::VideoDeviceInfo>,
     selected_input: Option<String>,
     selected_output: Option<String>,
+    selected_video: Option<String>,
     participants: Arc<Mutex<Vec<nexo_media::ParticipantStatus>>>,
 }
 
@@ -78,9 +80,11 @@ enum CallCommand {
         call_id: uuid::Uuid,
         input_device: Option<String>,
         output_device: Option<String>,
+        video_device: Option<String>,
     },
     SelectInput(String),
     SelectOutput(String),
+    SelectVideo(String),
     SetMuted(bool),
     Leave,
 }
@@ -104,8 +108,10 @@ pub fn start_app(data_dir: &Path) -> Result<AppInstance> {
     let (call_queue, call_requests) = tokio::sync::mpsc::unbounded_channel();
     let (input_devices, output_devices) =
         split_audio_devices(nexo_media::enumerate_audio_devices().unwrap_or_default());
+    let video_devices = nexo_video::enumerate_cameras().unwrap_or_default();
     let selected_input = default_device_id(&input_devices);
     let selected_output = default_device_id(&output_devices);
+    let selected_video = video_devices.first().map(|d| d.id.clone());
     let participants = Arc::new(Mutex::new(Vec::new()));
     let state = Rc::new(RefCell::new(AppState {
         identity: identity.clone(),
@@ -118,8 +124,10 @@ pub fn start_app(data_dir: &Path) -> Result<AppInstance> {
         call_muted: false,
         input_devices,
         output_devices,
+        video_devices,
         selected_input,
         selected_output,
+        selected_video,
         participants: Arc::clone(&participants),
     }));
 
@@ -232,6 +240,7 @@ fn bind_actions(app: &AppWindow, state: &Rc<RefCell<AppState>>) {
     bind_call_actions(app, state);
 }
 
+#[allow(clippy::too_many_lines)]
 fn bind_call_actions(app: &AppWindow, state: &Rc<RefCell<AppState>>) {
     let weak = app.as_weak();
     let action_state = Rc::clone(state);
@@ -245,6 +254,7 @@ fn bind_call_actions(app: &AppWindow, state: &Rc<RefCell<AppState>>) {
             call_id: community.default_channel_id,
             input_device: state.selected_input.clone(),
             output_device: state.selected_output.clone(),
+            video_device: state.selected_video.clone(),
         };
         if state.call_queue.send(command).is_ok() {
             state.call_active = true;
@@ -318,6 +328,25 @@ fn bind_call_actions(app: &AppWindow, state: &Rc<RefCell<AppState>>) {
             );
         }
         state.selected_output = id;
+    });
+
+    let weak = app.as_weak();
+    let action_state = Rc::clone(state);
+    app.on_select_video_device(move |display_name| {
+        let mut state = action_state.borrow_mut();
+        let id = video_id_for_display(&state.video_devices, display_name.as_str())
+            .or_else(|| Some(display_name.to_string()));
+        if state.call_active {
+            let _ = state
+                .call_queue
+                .send(CallCommand::SelectVideo(id.clone().unwrap_or_default()));
+        }
+        if let Some(app) = weak.upgrade() {
+            app.set_selected_video_device(
+                video_device_label(&state.video_devices, id.as_deref()).into(),
+            );
+        }
+        state.selected_video = id;
     });
 }
 
@@ -486,12 +515,58 @@ fn refresh_device_catalog(app: &AppWindow, state: &AppState) {
             .map(SharedString::from)
             .collect::<Vec<_>>(),
     )));
+    app.set_video_device_names(ModelRc::new(VecModel::from(
+        video_display_rows(&state.video_devices)
+            .into_iter()
+            .map(SharedString::from)
+            .collect::<Vec<_>>(),
+    )));
     app.set_selected_input_device(
         device_label(&state.input_devices, state.selected_input.as_deref()).into(),
     );
     app.set_selected_output_device(
         device_label(&state.output_devices, state.selected_output.as_deref()).into(),
     );
+    app.set_selected_video_device(
+        video_device_label(&state.video_devices, state.selected_video.as_deref()).into(),
+    );
+}
+
+fn video_device_label(devices: &[nexo_video::VideoDeviceInfo], id: Option<&str>) -> String {
+    match id {
+        Some(id) => devices
+            .iter()
+            .find(|device| device.id == id)
+            .map_or_else(|| id.to_owned(), |device| device.name.clone()),
+        None => devices.first().map_or_else(
+            || "Padrao / Sintetico".to_owned(),
+            |device| device.name.clone(),
+        ),
+    }
+}
+
+fn video_display_rows(devices: &[nexo_video::VideoDeviceInfo]) -> Vec<String> {
+    let mut used = std::collections::HashMap::<String, usize>::new();
+    devices
+        .iter()
+        .map(|device| {
+            let index = used.entry(device.name.clone()).or_insert(0);
+            let text = if *index == 0 {
+                device.name.clone()
+            } else {
+                format!("{} ({index})", device.name)
+            };
+            *index += 1;
+            text
+        })
+        .collect()
+}
+
+fn video_id_for_display(devices: &[nexo_video::VideoDeviceInfo], display: &str) -> Option<String> {
+    video_display_rows(devices)
+        .iter()
+        .position(|row| row == display)
+        .map(|index| devices[index].id.clone())
 }
 
 fn split_audio_devices(
@@ -827,7 +902,12 @@ async fn handle_call_command(
             call_id,
             input_device,
             output_device,
-        } => match CallEngine::with_devices(input_device.as_deref(), output_device.as_deref()) {
+            video_device,
+        } => match CallEngine::with_devices(
+            input_device.as_deref(),
+            output_device.as_deref(),
+            video_device.as_deref(),
+        ) {
             Ok(engine) => {
                 if let Some(engine) = call_engine.as_mut() {
                     let _ = Box::pin(engine.close()).await;
@@ -894,6 +974,9 @@ async fn handle_call_command(
                     }
                 }
             }
+        }
+        CallCommand::SelectVideo(_device_id) => {
+            update_call_status(app, "Camera selecionada".to_owned());
         }
         CallCommand::Leave => {
             if let Some((community_id, call_id)) = *active_call {

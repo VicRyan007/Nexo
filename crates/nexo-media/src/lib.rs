@@ -7,6 +7,7 @@ mod session;
 mod transport;
 mod video;
 mod video_codec;
+mod vpx_sys;
 
 pub use audio_codec::{EncodedAudioFrame, VoiceDecoder, VoiceEncoder};
 pub use capability::{

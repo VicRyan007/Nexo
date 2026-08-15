@@ -25,11 +25,6 @@ chrono = "0.4"
 cpal = "0.18.1"
 dirs = "6"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-# Raw libvpx bindings for the software VP8 codec pipeline (nexo-media). The
-# crate ships pre-generated bindings (no bindgen/libclang at build time) and
-# links a libvpx library located through the VPX_LIB_DIR / VPX_VERSION env vars
-# (see crates/nexo-media/build notes in docs/continuation.md). MPL-2.0.
-env-libvpx-sys = "5.1.0"
 futures = "0.3"
 if-addrs = "0.15"
 libp2p = { version = "0.56", features = ["cbor", "identify", "macros", "mdns", "noise", "ping", "quic", "request-response", "tcp", "tokio", "yamux"] }
