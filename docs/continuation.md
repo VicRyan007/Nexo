@@ -324,3 +324,11 @@ Checkpoint 2026-08-15 (Video Rendering UI, Progressive SFU Topology, Security Ha
    DoS/burst spamming on authenticated peer endpoints.
 5. All 69 workspace tests pass, zero warnings under strict Clippy (`-D warnings`), and `cargo fmt --all --check` is fully clean.
 
+Checkpoint 2026-08-15 (5-Phase Roadmap Delivery: Packaging, P2P File Transfer, Adaptive Bitrate, NAT Traversal, Audio DSP):
+1. Phase 1 - Native Packaging & Distribution: Release build profile optimizations (`opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = true`), binary metadata in `crates/nexo-app/Cargo.toml`, `scripts/package-windows.ps1` (built portable zip `dist/nexo-0.1.0-windows-x86_64.zip`), `scripts/package-linux.sh` (Debian .deb & .tar.gz), `.desktop` entry, and automated GitHub Actions release pipeline `.github/workflows/release.yml`.
+2. Phase 2 - P2P Chunked File & Media Transfer: Created `nexo-core::file_transfer` (`FileTransferOffer`, `FileChunk`, Ed25519 signature & SHA-256 chunk integrity), `nexo-net::file_transfer` (`FileTransferRequest`/`Response` protocol over `/nexo/file-transfer/0.1.0`), and SQLite persistence in `nexo-store` (`file_transfers` & `file_chunks_saved` with resumable tracking).
+3. Phase 3 - Congestion Control & Adaptive Bitrate: Implemented `nexo-media::congestion::CongestionController` with AIMD (Additive Increase / Multiplicative Decrease) dynamic adaptation reacting to RTT, packet loss ratio, and jitter to adjust VP8 target bitrate, framerate, and resolution tier.
+4. Phase 4 - NAT Traversal (STUN / TURN): Implemented `nexo-core::nat::{NatConfig, IceServer}` with support for external STUN/TURN servers while preserving direct zero-cloud LAN-only operation by default.
+5. Phase 5 - Audio DSP (Acoustic Echo Cancellation & Noise Suppression): Implemented `nexo-media::dsp::{AcousticEchoCanceller, NoiseSuppressor, AudioDspPipeline}` using NLMS adaptive filtering and RMS noise floor tracking.
+6. Full Workspace Verification: 76 unit and integration tests passing across all crates with 0 warnings on strict Clippy (`-D warnings`) and clean formatting.
+

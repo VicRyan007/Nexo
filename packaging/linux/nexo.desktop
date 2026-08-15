@@ -1,0 +1,9 @@
+﻿[Desktop Entry]
+Name=Nexo
+Comment=P2P Private Offline-First Collaboration
+Exec=nexo
+Icon=nexo
+Terminal=false
+Type=Application
+Categories=Network;Chat;InstantMessaging;AudioVideo;
+StartupWMClass=nexo

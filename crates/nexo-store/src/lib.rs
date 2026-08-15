@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use nexo_core::{
-    CallSignal, CommunityCredential, MessageError, SignedMessage, community_sync_token,
+    CallSignal, CommunityCredential, FileTransferOffer, MessageError, SignedMessage,
+    community_sync_token,
 };
 use rusqlite::{Connection, OptionalExtension as _, params};
 use thiserror::Error;
@@ -15,6 +16,24 @@ pub struct Community {
     pub id: Uuid,
     pub name: String,
     pub default_channel_id: Uuid,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredFileTransfer {
+    pub id: Uuid,
+    pub community_id: Uuid,
+    pub channel_id: Uuid,
+    pub file_name: String,
+    pub file_size: u64,
+    pub mime_type: String,
+    pub chunk_size: u32,
+    pub total_chunks: u32,
+    pub root_sha256: [u8; 32],
+    pub author_key: [u8; 32],
+    pub local_path: Option<String>,
+    pub status: String,
+    pub downloaded_chunks: u32,
+    pub created_at: u64,
 }
 
 #[derive(Debug, Error)]
@@ -36,6 +55,7 @@ pub struct LocalStore {
 }
 
 impl LocalStore {
+    #[allow(clippy::too_many_lines)]
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -105,6 +125,27 @@ impl LocalStore {
                  author_key BLOB NOT NULL,
                  sequence INTEGER NOT NULL,
                  received_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS file_transfers (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 community_id TEXT NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+                 channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+                 file_name TEXT NOT NULL,
+                 file_size INTEGER NOT NULL,
+                 mime_type TEXT NOT NULL,
+                 chunk_size INTEGER NOT NULL,
+                 total_chunks INTEGER NOT NULL,
+                 root_sha256 BLOB NOT NULL,
+                 author_key BLOB NOT NULL,
+                 local_path TEXT,
+                 status TEXT NOT NULL,
+                 downloaded_chunks INTEGER NOT NULL DEFAULT 0,
+                 created_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS file_chunks_saved (
+                 transfer_id TEXT NOT NULL REFERENCES file_transfers(id) ON DELETE CASCADE,
+                 chunk_index INTEGER NOT NULL,
+                 PRIMARY KEY(transfer_id, chunk_index)
              );
              CREATE INDEX IF NOT EXISTS messages_timeline
                  ON messages(channel_id, created_at, id);",
@@ -250,6 +291,191 @@ impl LocalStore {
             params![community_id.to_string(), member_key],
         )?;
         Ok(deleted_member > 0)
+    }
+
+    /// Record a file transfer offer into the local database.
+    pub fn record_file_offer(
+        &self,
+        offer: &FileTransferOffer,
+        local_path: Option<&str>,
+        status: &str,
+        now: u64,
+    ) -> Result<bool, StoreError> {
+        offer
+            .verify(now)
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        if !self.is_authorized_member(offer.community_id, &offer.author_key)? {
+            return Err(StoreError::UnauthorizedAuthor);
+        }
+        let inserted = self.connection.execute(
+            "INSERT OR IGNORE INTO file_transfers(
+                 id, community_id, channel_id, file_name, file_size, mime_type,
+                 chunk_size, total_chunks, root_sha256, author_key, local_path,
+                 status, downloaded_chunks, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                offer.id.to_string(),
+                offer.community_id.to_string(),
+                offer.channel_id.to_string(),
+                offer.file_name,
+                to_i64(offer.file_size)?,
+                offer.mime_type,
+                to_i64(u64::from(offer.chunk_size))?,
+                to_i64(u64::from(offer.total_chunks))?,
+                offer.root_sha256.as_slice(),
+                offer.author_key.as_slice(),
+                local_path,
+                status,
+                0,
+                to_i64(offer.created_at)?
+            ],
+        )?;
+        Ok(inserted == 1)
+    }
+
+    /// Record a downloaded chunk for a file transfer and update `downloaded_chunks` count.
+    pub fn record_chunk_received(
+        &self,
+        transfer_id: Uuid,
+        chunk_index: u32,
+    ) -> Result<u32, StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO file_chunks_saved(transfer_id, chunk_index)
+             VALUES (?1, ?2)",
+            params![transfer_id.to_string(), to_i64(u64::from(chunk_index))?],
+        )?;
+        let count: i64 = transaction.query_row(
+            "SELECT count(1) FROM file_chunks_saved WHERE transfer_id = ?1",
+            [transfer_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let count_u32 =
+            u32::try_from(count).map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        transaction.execute(
+            "UPDATE file_transfers SET downloaded_chunks = ?1 WHERE id = ?2",
+            params![count, transfer_id.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(count_u32)
+    }
+
+    /// Retrieve a file transfer by id.
+    pub fn file_transfer(
+        &self,
+        transfer_id: Uuid,
+    ) -> Result<Option<StoredFileTransfer>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, community_id, channel_id, file_name, file_size, mime_type,
+                        chunk_size, total_chunks, root_sha256, author_key, local_path,
+                        status, downloaded_chunks, created_at
+                 FROM file_transfers WHERE id = ?1",
+                [transfer_id.to_string()],
+                |row| {
+                    let id_str: String = row.get(0)?;
+                    let comm_str: String = row.get(1)?;
+                    let chan_str: String = row.get(2)?;
+                    let root_sha_vec: Vec<u8> = row.get(8)?;
+                    let author_vec: Vec<u8> = row.get(9)?;
+                    let root_sha256: [u8; 32] = root_sha_vec
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                    let author_key: [u8; 32] = author_vec
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+
+                    Ok(StoredFileTransfer {
+                        id: parse_uuid(&id_str).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        community_id: parse_uuid(&comm_str)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        channel_id: parse_uuid(&chan_str)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        file_name: row.get(3)?,
+                        file_size: u64::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+                        mime_type: row.get(5)?,
+                        chunk_size: u32::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
+                        total_chunks: u32::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+                        root_sha256,
+                        author_key,
+                        local_path: row.get(10)?,
+                        status: row.get(11)?,
+                        downloaded_chunks: u32::try_from(row.get::<_, i64>(12)?).unwrap_or(0),
+                        created_at: u64::try_from(row.get::<_, i64>(13)?).unwrap_or(0),
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::Database)
+    }
+
+    /// List all file transfers for a channel.
+    pub fn file_transfers_in_channel(
+        &self,
+        channel_id: Uuid,
+    ) -> Result<Vec<StoredFileTransfer>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, community_id, channel_id, file_name, file_size, mime_type,
+                    chunk_size, total_chunks, root_sha256, author_key, local_path,
+                    status, downloaded_chunks, created_at
+             FROM file_transfers WHERE channel_id = ?1 ORDER BY created_at",
+        )?;
+        let rows = statement.query_map([channel_id.to_string()], |row| {
+            let id_str: String = row.get(0)?;
+            let comm_str: String = row.get(1)?;
+            let chan_str: String = row.get(2)?;
+            let root_sha_vec: Vec<u8> = row.get(8)?;
+            let author_vec: Vec<u8> = row.get(9)?;
+            let root_sha256: [u8; 32] = root_sha_vec
+                .try_into()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let author_key: [u8; 32] = author_vec
+                .try_into()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+
+            Ok(StoredFileTransfer {
+                id: parse_uuid(&id_str).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                community_id: parse_uuid(&comm_str).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                channel_id: parse_uuid(&chan_str).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                file_name: row.get(3)?,
+                file_size: u64::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+                mime_type: row.get(5)?,
+                chunk_size: u32::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
+                total_chunks: u32::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+                root_sha256,
+                author_key,
+                local_path: row.get(10)?,
+                status: row.get(11)?,
+                downloaded_chunks: u32::try_from(row.get::<_, i64>(12)?).unwrap_or(0),
+                created_at: u64::try_from(row.get::<_, i64>(13)?).unwrap_or(0),
+            })
+        })?;
+        let mut transfers = Vec::new();
+        for row in rows {
+            transfers.push(row?);
+        }
+        Ok(transfers)
+    }
+
+    /// Update status and optional local path of a file transfer.
+    pub fn update_file_transfer_status(
+        &self,
+        transfer_id: Uuid,
+        status: &str,
+        local_path: Option<&str>,
+    ) -> Result<(), StoreError> {
+        if let Some(path) = local_path {
+            self.connection.execute(
+                "UPDATE file_transfers SET status = ?1, local_path = ?2 WHERE id = ?3",
+                params![status, path, transfer_id.to_string()],
+            )?;
+        } else {
+            self.connection.execute(
+                "UPDATE file_transfers SET status = ?1 WHERE id = ?2",
+                params![status, transfer_id.to_string()],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn save_credential(&self, credential: &CommunityCredential) -> Result<(), StoreError> {
@@ -1141,6 +1367,67 @@ mod tests {
                 .is_authorized_member(community_id, &member.public_key_bytes())
                 .expect("member should not be authorized")
         );
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn file_transfer_offer_and_chunk_tracking_works() {
+        use nexo_core::{FileTransferOffer, compute_sha256, current_timestamp};
+
+        let path = std::env::temp_dir().join(format!("nexo-files-{}.sqlite3", Uuid::new_v4()));
+        let member = DeviceIdentity::generate();
+        let community_id = Uuid::new_v4();
+        let now = current_timestamp();
+        let mut store = LocalStore::open(&path).expect("store should open");
+        let community = store
+            .create_community(community_id, "Arquivos", now)
+            .expect("community should be created");
+        store
+            .authorize_member(community_id, &member.public_key_bytes(), now)
+            .expect("member should be authorized");
+
+        let content = b"Sample binary payload transferred chunk by chunk";
+        let root_hash = compute_sha256(content);
+
+        let offer = FileTransferOffer::create(
+            &member,
+            community_id,
+            community.default_channel_id,
+            "project_spec.pdf".into(),
+            content.len() as u64,
+            "application/pdf".into(),
+            root_hash,
+            now,
+        )
+        .expect("offer should be created");
+
+        assert!(
+            store
+                .record_file_offer(&offer, Some("/tmp/project_spec.pdf"), "completed", now)
+                .expect("offer should be saved")
+        );
+
+        let fetched = store
+            .file_transfer(offer.id)
+            .expect("fetch should succeed")
+            .expect("transfer should exist");
+
+        assert_eq!(fetched.file_name, "project_spec.pdf");
+        assert_eq!(fetched.file_size, content.len() as u64);
+        assert_eq!(fetched.status, "completed");
+
+        // Test chunk recording
+        let count = store
+            .record_chunk_received(offer.id, 0)
+            .expect("chunk recorded");
+        assert_eq!(count, 1);
+
+        let list = store
+            .file_transfers_in_channel(community.default_channel_id)
+            .expect("channel file list should succeed");
+        assert_eq!(list.len(), 1);
 
         drop(store);
         let _ = std::fs::remove_file(path);

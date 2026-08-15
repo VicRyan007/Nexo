@@ -38,10 +38,15 @@ O projeto é estruturado em uma arquitetura modular de crates Rust:
 - [x] **Identidade e Segurança**: Chaves Ed25519 salvas localmente, mensagens e sinais de presença assinados e verificados.
 - [x] **Comunidades e Mensagens Offline**: Criação e entrada por convites assinados com expiração, sincronização automática ao reconectar.
 - [x] **Descoberta LAN**: Descoberta automática de pares na rede local via mDNS.
+- [x] **Transferência P2P de Arquivos**: Envio e recebimento de mídias/arquivos em pedaços de 64 KB com hashing SHA-256 e assinatura Ed25519.
 - [x] **Voz WebRTC P2P**: Áudio Opus (20 ms, VBR, FEC, DTX), troca de microfone/alto-falante a quente sem queda de chamada, buffer de jitter com ocultação de perda de pacotes.
-- [x] **Vídeo WebRTC P2P**: Captura de câmera e tela, conversão para I420, codificador/decodificador de vídeo VP8 e empacotamento RTP com adaptação de taxa de bits (RTCP REMB).
-- [x] **Topologia SFU & E2E Crypto**: Eleição determinística de nó hospedeiro por capacidade de rede/hardware, failover automático de standby por heartbeat e cifra autenticada SHA-256 para pacotes de mídia.
-- [x] **Interface Slint Desktop**: Navegação em comunidades, canais de texto, painel de controle de chamada, lista de participantes conectados e seletores de microfone, saída de áudio e câmera.
+- [x] **Vídeo WebRTC P2P**: Captura de câmera e tela, conversão para I420, codec VP8 autocontido e empacotamento RTP.
+- [x] **Controle de Congestionamento & Bitrate Adaptativo**: Algoritmo AIMD avaliando RTT, perda de pacotes e jitter para ajuste dinâmico de bitrate, FPS e resolução.
+- [x] **Áudio DSP Avançado**: Cancelamento de Eco Acústico (AEC com filtro adaptativo NLMS), Supressão de Ruído de Fundo (RMS) e Detecção de Atividade Vocal (VAD).
+- [x] **Topologia SFU & E2E Crypto**: Eleição determinística de nó hospedeiro por capacidade de rede/hardware, failover automático de standby por heartbeat e cifra autenticada para pacotes de mídia.
+- [x] **Suporte a NAT Traversal**: Conexão entre redes diferentes via servidores STUN/TURN opcionais, mantendo operação 100% LAN por padrão.
+- [x] **Interface Slint Desktop**: Navegação em comunidades, canais de texto, painel de chamada com visualização de vídeo local e remoto, lista de participantes e seletores de microfone, saída e câmera.
+- [x] **Empacotamento Nativo**: Scripts de build e empacotamento para Windows (`.zip` portátil) e Linux (`.deb` / `.tar.gz` com `.desktop` entry) e pipeline automatizado no GitHub Actions.
 
 ---
 

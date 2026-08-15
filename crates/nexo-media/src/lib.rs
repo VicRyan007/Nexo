@@ -1,6 +1,8 @@
 mod audio_codec;
 mod capability;
+pub mod congestion;
 mod devices;
+pub mod dsp;
 mod engine;
 mod jitter;
 mod session;
@@ -13,10 +15,12 @@ pub use audio_codec::{EncodedAudioFrame, VoiceDecoder, VoiceEncoder};
 pub use capability::{
     AccelerationApi, CapabilityReport, CaptureBackend, CodecCapability, MediaKind, RuntimeProbe,
 };
+pub use congestion::{CongestionController, NetworkMetrics, VideoQualityProfile};
 pub use devices::{
     AudioDeviceInfo, AudioDeviceKind, AudioFrame, InputFrameSource, InputLevelMonitor,
     OPUS_FRAME_SAMPLES, OPUS_SAMPLE_RATE, OutputPlayback, enumerate_audio_devices,
 };
+pub use dsp::{AcousticEchoCanceller, AudioDspPipeline, NoiseSuppressor};
 pub use engine::{CallEngine, CallEngineEvent, ParticipantStatus};
 pub use jitter::{JitterBuffer, PlayoutFrame};
 pub use session::{
