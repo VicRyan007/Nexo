@@ -332,3 +332,12 @@ Checkpoint 2026-08-15 (5-Phase Roadmap Delivery: Packaging, P2P File Transfer, A
 5. Phase 5 - Audio DSP (Acoustic Echo Cancellation & Noise Suppression): Implemented `nexo-media::dsp::{AcousticEchoCanceller, NoiseSuppressor, AudioDspPipeline}` using NLMS adaptive filtering and RMS noise floor tracking.
 6. Full Workspace Verification: 76 unit and integration tests passing across all crates with 0 warnings on strict Clippy (`-D warnings`) and clean formatting.
 
+Checkpoint 2026-08-15 (Nexo v0.2.0: Multi-Channel Communities, Double Ratchet PFS, TreeKEM MLS, System Tray & Rich Chat):
+1. Multi-Channel Communities: Added `ChannelKind::Text` vs `ChannelKind::Voice` and `LocalStore::create_channel` / `LocalStore::channels` in `nexo-store` with SQLite schema migration and test suite.
+2. 1-to-1 DMs with Double Ratchet: Created `nexo-core::double_ratchet::{DoubleRatchetSession, RatchetMessage, RatchetError}` implementing DH + symmetric KDF chain ratchets for Perfect Forward Secrecy and break-in recovery.
+3. TreeKEM MLS Group Key Exchange: Created `nexo-core::mls::{MlsGroupState, MlsMember, MlsError}` implementing RFC 9420 left-balanced binary key trees and epoch secret derivation.
+4. Procedural Audio Tones: Created `nexo-media::tones::{AudioToneKind, generate_tone}` synthesizing telephone ringtones and notification chimes.
+5. Rich Markdown & Emojis: Created `nexo-core::markdown::{parse_markdown, replace_emoji_shortcodes}` and wired into Slint UI composer.
+6. System Tray: Created `nexo-app::tray::{TrayState, TrayAction}` for background presence management.
+7. Workspace Validation: 83 tests passing with 100% success and 0 Clippy warnings.
+

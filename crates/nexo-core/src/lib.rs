@@ -1,4 +1,5 @@
 pub mod call_signal;
+pub mod double_ratchet;
 pub mod election;
 pub mod file_transfer;
 pub mod identity;
@@ -7,12 +8,14 @@ pub mod markdown;
 pub mod media_crypto;
 pub mod membership;
 pub mod message;
+pub mod mls;
 pub mod nat;
 pub mod sfu_forwarder;
 
 pub use call_signal::{
     CallNegotiationRole, CallSignal, CallSignalError, CallSignalKind, call_negotiation_role,
 };
+pub use double_ratchet::{DoubleRatchetSession, RatchetError, RatchetMessage};
 pub use election::{
     ElectionPolicy, NodeMetrics, SfuMigrationState, SfuTopology, SfuTopologyEvent, elect_host,
 };
@@ -26,5 +29,6 @@ pub use markdown::{FormattedSegment, parse_markdown, replace_emoji_shortcodes};
 pub use media_crypto::{MediaCryptoError, MediaFrameCipher};
 pub use membership::{CommunityCredential, MembershipError, community_sync_token, peer_sync_token};
 pub use message::{MessageError, SignedMessage};
+pub use mls::{MlsError, MlsGroupState, MlsMember};
 pub use nat::{IceServer, NatConfig};
 pub use sfu_forwarder::{ForwardedMediaPacket, MediaType, SfuForwarder};

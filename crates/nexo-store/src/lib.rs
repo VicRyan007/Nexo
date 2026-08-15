@@ -18,6 +18,43 @@ pub struct Community {
     pub default_channel_id: Uuid,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelKind {
+    Text,
+    Voice,
+}
+
+impl ChannelKind {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Voice => "voice",
+        }
+    }
+}
+
+impl std::str::FromStr for ChannelKind {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("voice") {
+            Ok(Self::Voice)
+        } else {
+            Ok(Self::Text)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Channel {
+    pub id: Uuid,
+    pub community_id: Uuid,
+    pub name: String,
+    pub position: u32,
+    pub kind: ChannelKind,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredFileTransfer {
     pub id: Uuid,
@@ -156,6 +193,12 @@ impl LocalStore {
                 [],
             )?;
         }
+        if !has_column(&connection, "channels", "kind")? {
+            connection.execute(
+                "ALTER TABLE channels ADD COLUMN kind TEXT NOT NULL DEFAULT 'text'",
+                [],
+            )?;
+        }
         migrate_credentials(&mut connection)?;
         connection.execute(
             "INSERT OR IGNORE INTO metadata(key, value) VALUES ('database_epoch', ?1)",
@@ -194,6 +237,69 @@ impl LocalStore {
         self.community(id)?.ok_or_else(|| {
             StoreError::InvalidData("community was not available after insertion".to_owned())
         })
+    }
+
+    /// Create a new channel in a community.
+    pub fn create_channel(
+        &self,
+        community_id: Uuid,
+        name: &str,
+        kind: ChannelKind,
+    ) -> Result<Channel, StoreError> {
+        let channel_id = Uuid::new_v4();
+        let max_pos: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM channels WHERE community_id = ?1",
+                [community_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let pos = u32::try_from(max_pos.max(0)).unwrap_or(0);
+        self.connection.execute(
+            "INSERT INTO channels(id, community_id, name, position, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(community_id, name) DO UPDATE SET kind = excluded.kind",
+            params![
+                channel_id.to_string(),
+                community_id.to_string(),
+                name,
+                pos,
+                kind.as_str()
+            ],
+        )?;
+        Ok(Channel {
+            id: channel_id,
+            community_id,
+            name: name.to_owned(),
+            position: pos,
+            kind,
+        })
+    }
+
+    /// List all channels for a given community.
+    pub fn channels(&self, community_id: Uuid) -> Result<Vec<Channel>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, community_id, name, position, kind
+             FROM channels WHERE community_id = ?1 ORDER BY position, name",
+        )?;
+        let rows = statement.query_map([community_id.to_string()], |row| {
+            let id_str: String = row.get(0)?;
+            let comm_str: String = row.get(1)?;
+            let kind_str: String = row.get(4)?;
+            Ok(Channel {
+                id: parse_uuid(&id_str).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                community_id: parse_uuid(&comm_str).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                name: row.get(2)?,
+                position: u32::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                kind: kind_str.parse().unwrap_or(ChannelKind::Text),
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
     }
 
     pub fn authorize_member(
@@ -1428,6 +1534,50 @@ mod tests {
             .file_transfers_in_channel(community.default_channel_id)
             .expect("channel file list should succeed");
         assert_eq!(list.len(), 1);
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn multiple_channels_text_and_voice_management_works() {
+        use nexo_core::current_timestamp;
+
+        let path = std::env::temp_dir().join(format!("nexo-channels-{}.sqlite3", Uuid::new_v4()));
+        let community_id = Uuid::new_v4();
+        let now = current_timestamp();
+        let mut store = LocalStore::open(&path).expect("store should open");
+        let community = store
+            .create_community(community_id, "Comunidade Multicanais", now)
+            .expect("community should be created");
+
+        // 1. Initial channels contains default text channel "geral"
+        let initial_channels = store
+            .channels(community.id)
+            .expect("channels list succeeds");
+        assert_eq!(initial_channels.len(), 1);
+        assert_eq!(initial_channels[0].name, "geral");
+        assert_eq!(initial_channels[0].kind, ChannelKind::Text);
+
+        // 2. Add another text channel and two voice channels
+        let c_anuncios = store
+            .create_channel(community.id, "anuncios", ChannelKind::Text)
+            .expect("anuncios created");
+        let c_voz1 = store
+            .create_channel(community.id, "Sala de Voz 1", ChannelKind::Voice)
+            .expect("voz 1 created");
+        let c_voz2 = store
+            .create_channel(community.id, "Sala de Jogos", ChannelKind::Voice)
+            .expect("voz 2 created");
+
+        assert_eq!(c_anuncios.kind, ChannelKind::Text);
+        assert_eq!(c_voz1.kind, ChannelKind::Voice);
+        assert_eq!(c_voz2.kind, ChannelKind::Voice);
+
+        let all_channels = store
+            .channels(community.id)
+            .expect("channels list succeeds");
+        assert_eq!(all_channels.len(), 4);
 
         drop(store);
         let _ = std::fs::remove_file(path);

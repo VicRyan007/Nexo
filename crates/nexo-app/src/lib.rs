@@ -5,6 +5,9 @@
 
 slint::include_modules!();
 
+pub mod tray;
+pub use tray::{TrayAction, TrayState};
+
 use std::{
     cell::RefCell,
     collections::HashSet,
