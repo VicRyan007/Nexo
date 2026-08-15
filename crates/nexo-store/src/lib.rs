@@ -216,6 +216,29 @@ impl LocalStore {
         parse_uuid(&value)
     }
 
+    /// Retrieve a persisted key-value setting from metadata table.
+    pub fn get_metadata(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT value FROM metadata WHERE key = ?1")?;
+        let mut rows = stmt.query([key])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Store or update a persisted key-value setting in metadata table.
+    pub fn set_metadata(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO metadata(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
     pub fn create_community(
         &mut self,
         id: Uuid,

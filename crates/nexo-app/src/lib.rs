@@ -340,6 +340,9 @@ fn bind_call_actions(app: &AppWindow, state: &Rc<RefCell<AppState>>) {
         if let Some(app) = weak.upgrade() {
             app.set_selected_input_device(device_label(&state.input_devices, id.as_deref()).into());
         }
+        let _ = state
+            .store
+            .set_metadata("pref_input_device", display_name.as_str());
         state.selected_input = id;
     });
 
@@ -359,6 +362,9 @@ fn bind_call_actions(app: &AppWindow, state: &Rc<RefCell<AppState>>) {
                 device_label(&state.output_devices, id.as_deref()).into(),
             );
         }
+        let _ = state
+            .store
+            .set_metadata("pref_output_device", display_name.as_str());
         state.selected_output = id;
     });
 
@@ -378,6 +384,9 @@ fn bind_call_actions(app: &AppWindow, state: &Rc<RefCell<AppState>>) {
                 video_device_label(&state.video_devices, id.as_deref()).into(),
             );
         }
+        let _ = state
+            .store
+            .set_metadata("pref_video_device", display_name.as_str());
         state.selected_video = id;
     });
 

@@ -1,0 +1,134 @@
+﻿# Manual do Usuário: Nexo Desktop
+
+Bem-vindo ao **Nexo**, a plataforma nativa de colaboração peer-to-peer (P2P), segura, local-first e sem servidores centrais para comunicação de texto, voz, vídeo e transferência de arquivos.
+
+---
+
+## 📑 Índice
+1. [Visão Geral & Filosofia](#visão-geral--filosofia)
+2. [Instalação & Execução](#instalação--execução)
+   - [Windows](#windows)
+   - [Linux](#linux)
+3. [Primeiros Passos](#primeiros-passos)
+   - [Criando sua Identidade Criptográfica](#criando-sua-identidade-criptográfica)
+   - [Criando uma Nova Comunidade](#criando-uma-nova-comunidade)
+   - [Entrando em uma Comunidade via Convite](#entrando-em-uma-comunidade-via-convite)
+4. [Chat e Recursos de Mensagens](#chat-e-recursos-de-mensagens)
+   - [Formatação Markdown e Emojis](#formatação-markdown-e-emojis)
+   - [Transferência P2P de Arquivos](#transferência-p2p-de-arquivos)
+   - [Notas de Voz Rápidas](#notas-de-voz-rápidas)
+5. [Chamadas de Voz e Vídeo WebRTC](#chamadas-de-voz-e-vídeo-webrtc)
+   - [Entrando na Voz](#entrando-na-voz)
+   - [Ligar/Desligar Câmera e Compartilhar Tela](#ligardesligar-câmera-e-compartilhar-tela)
+   - [Configuração e Troca a Quente de Dispositivos](#configuração-e-troca-a-quente-de-dispositivos)
+6. [Segurança e Criptografia](#segurança-e-criptografia)
+7. [Solução de Problemas (Troubleshooting)](#solução-de-problemas-troubleshooting)
+
+---
+
+## 🌟 Visão Geral & Filosofia
+
+O Nexo foi projetado sob os seguintes princípios:
+- **Zero Nuvem / Sem Servidor Central**: Nenhuma empresa armazena suas mensagens, senhas ou chamadas.
+- **Local-First**: Suas conversas e dados pertencem ao seu computador (banco SQLite local) e continuam disponíveis sem acesso à internet.
+- **Criptografia Ponta a Ponta Real**: Assinaturas digitais Ed25519 em cada mensagem e criptografia autenticada em fluxos de mídia.
+- **Descoberta LAN Automática**: Nós na mesma rede local se encontram automaticamente via mDNS.
+
+---
+
+## 💻 Instalação & Execução
+
+### Windows
+1. Baixe o arquivo `nexo-windows-x86_64.zip` na página de [Releases](https://github.com/VicRyan007/Nexo/releases).
+2. Extraia o conteúdo em uma pasta de sua preferência.
+3. Dê um duplo clique no executável `nexo.exe`.
+
+### Linux
+- **Debian / Ubuntu (.deb)**:
+  ```bash
+  sudo dpkg -i nexo_1.0.0_amd64.deb
+  nexo
+  ```
+- **Tarball Portátil (.tar.gz)**:
+  ```bash
+  tar -xzf nexo-1.0.0-linux-x86_64.tar.gz
+  ./nexo
+  ```
+
+---
+
+## 🚀 Primeiros Passos
+
+### Criando sua Identidade Criptográfica
+Ao abrir o Nexo pela primeira vez, uma chave criptográfica **Ed25519** de 256 bits é gerada automaticamente e armazenada de forma segura no seu perfil de usuário local (`~/.nexo/identity.key` ou `%LOCALAPPDATA%\Nexo\identity.key`).
+
+### Criando uma Nova Comunidade
+1. Na barra lateral esquerda, digite um nome no campo **Criar Comunidade** (ex: `Devs`).
+2. Clique em **Criar e gerar convite**.
+3. O Nexo criará a comunidade com o canal padrão `# geral` e exibirá um código de convite assinado no formato `NEXO1...`.
+4. Copie esse código e envie para seus amigos.
+
+### Entrando em uma Comunidade via Convite
+1. Recebeu um convite de um colega? Cole o código no campo **Entrar com convite**.
+2. Clique em **Entrar**.
+3. Seu nó se conectará automaticamente com o criador e com os outros membros na rede local, sincronizando o histórico de mensagens instantaneamente.
+
+---
+
+## 💬 Chat e Recursos de Mensagens
+
+### Formatação Markdown e Emojis
+O chat do Nexo suporta formatação em tempo real:
+- `**negrito**` -> **negrito**
+- `*itálico*` -> *itálico*
+- `` `código inline` `` -> `código inline`
+- ` ```linguagem ... ``` ` -> bloco de código destacado
+- Shortcodes de emoji automáticos: `:rocket:`, `:smile:`, `:+1:`, `:fire:`, `:lock:`, `:mic:`, `:camera:`.
+
+### Transferência P2P de Arquivos
+1. Clique no botão **`+`** ao lado da barra de mensagens.
+2. O arquivo será fragmentado em pedaços de 64 KB com hashes SHA-256 e transmitido diretamente aos pares conectados via protocolo `/nexo/file-transfer/0.1.0`.
+
+### Notas de Voz Rápidas
+1. Clique no botão **`Voz`** ao lado do campo de mensagem.
+2. O status mudará para **`Gravando`**. Fale sua mensagem.
+3. Clique novamente para concluir e enviar o áudio instantaneamente ao canal.
+
+---
+
+## 🎙️ Chamadas de Voz e Vídeo WebRTC
+
+### Entrando na Voz
+1. Selecione a comunidade desejada.
+2. No painel de voz, clique em **Entrar na voz**.
+3. O status mudará para **CONECTADO** em verde esmeralda.
+4. O áudio utiliza o codec **Opus** em 48 kHz com cancelamento de eco (AEC) e supressão de ruído inteligente.
+
+### Ligar/Desligar Câmera e Compartilhar Tela
+- **Câmera**: Clique em **Cam ON / Cam OFF** para transmitir sua webcam em tempo real (VP8).
+- **Compartilhar Tela**: Clique em **Comp. Tela / Parar Tela** para transmitir sua área de trabalho com baixa latência.
+- O vídeo do participante remoto e sua prévia local aparecem automaticamente no topo do painel principal.
+
+### Configuração e Troca a Quente de Dispositivos
+Nos seletores **MICROFONE**, **ALTO-FALANTE** e **CAMERA**, você pode alternar livremente seus periféricos durante a chamada sem interrupção. O Nexo memoriza suas preferências para as próximas sessões.
+
+---
+
+## 🛡️ Segurança e Criptografia
+- **Mensagens de Comunidade**: Assinadas por Ed25519 com verificação de autorização de membro.
+- **Mensagens Diretas 1-a-1**: Criptografadas com o protocolo **Double Ratchet**, garantindo sigilo futuro perfeito (*Perfect Forward Secrecy*).
+- **Grupos MLS**: Conformidade com a especificação **RFC 9420 (TreeKEM)** para derivação assimétrica de chaves de grupo em $O(\log N)$.
+- **Fluxos de Mídia**: Pacotes de voz e vídeo protegidos por cifra autenticada (`MediaFrameCipher`).
+
+---
+
+## ❓ Solução de Problemas (Troubleshooting)
+
+### Não encontro meus amigos na rede local
+1. Certifique-se de que ambos os computadores estão conectados na mesma sub-rede Wi-Fi/Ethernet.
+2. Verifique se o Firewall do Windows ou `iptables/ufw` no Linux permite tráfego multicast UDP (porta 5353 para mDNS) e portas UDP efêmeras para WebRTC.
+3. Confirme se ambos utilizaram convites válidos gerados pela mesma comunidade.
+
+### Áudio com eco ou ruído de fundo
+1. O pipeline de DSP do Nexo inclui cancelador de eco acústico adaptativo (AEC) e filtro de ruído RMS.
+2. Recomendamos o uso de fones de ouvido para máxima clareza sonora.

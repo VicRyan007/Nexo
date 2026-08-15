@@ -4471,7 +4471,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nexo-app"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-compat",
@@ -4493,7 +4493,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -4508,7 +4508,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-media"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4527,7 +4527,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-net"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -4542,7 +4542,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-store"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "nexo-core",
  "rusqlite",
@@ -4553,7 +4553,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-video"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ashpd",
  "libc",

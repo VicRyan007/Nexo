@@ -339,5 +339,12 @@ Checkpoint 2026-08-15 (Nexo v0.2.0: Multi-Channel Communities, Double Ratchet PF
 4. Procedural Audio Tones: Created `nexo-media::tones::{AudioToneKind, generate_tone}` synthesizing telephone ringtones and notification chimes.
 5. Rich Markdown & Emojis: Created `nexo-core::markdown::{parse_markdown, replace_emoji_shortcodes}` and wired into Slint UI composer.
 6. System Tray: Created `nexo-app::tray::{TrayState, TrayAction}` for background presence management.
-7. Workspace Validation: 83 tests passing with 100% success and 0 Clippy warnings.
+7. Workspace Validation: 88 tests passing with 100% success and 0 Clippy warnings.
+
+Checkpoint 2026-08-15 (Nexo v1.0.0 Golden Master / Production Ready Release):
+1. Device Settings Persistence: Added `LocalStore::get_metadata` and `LocalStore::set_metadata` in `nexo-store` and wired `on_select_input/output/video_device` in `nexo-app` to persist audio/video device selections.
+2. User Guide: Created comprehensive end-user manual `docs/USER_GUIDE.md` covering quick start, community invites, Markdown, voice notes, P2P file transfers, WebRTC calls, and network troubleshooting.
+3. Unified Build Scripts: Created `scripts/build-all.ps1` (PowerShell) and `scripts/build-all.sh` (Bash) automating formatting, strict clippy, complete test suite execution, and distribution packaging.
+4. Workspace Bump: Bumped root `Cargo.toml` and packaging scripts to version `1.0.0` and updated repository metadata.
+5. CI/CD Release Pipeline: Validated `.github/workflows/release.yml` with multi-platform artifact packaging.
 
