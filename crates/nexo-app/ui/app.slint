@@ -21,8 +21,11 @@ export struct ParticipantRow {
 
 export component AppWindow inherits Window {
     title: "Nexo";
-    width: 1120px;
-    height: 720px;
+    icon: @image-url("assets/nexo.png");
+    min-width: 880px;
+    min-height: 560px;
+    preferred-width: 1180px;
+    preferred-height: 740px;
     background: #101417;
 
     in-out property <string> status-text: "Procurando pessoas na rede local";
