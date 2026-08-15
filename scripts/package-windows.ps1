@@ -1,4 +1,4 @@
-﻿# Windows packaging script for Nexo
+# Windows packaging script for Nexo
 param(
     [string]$Version = "0.1.0",
     [string]$OutDir = "dist"
@@ -37,7 +37,8 @@ Copy-Item $BinaryPath -Destination (Join-Path $TempStage "nexo.exe")
 Copy-Item (Join-Path $PSScriptRoot "..\README.md") -Destination (Join-Path $TempStage "README.md")
 
 if (Test-Path $ZipPath) { Remove-Item -Force $ZipPath }
-Compress-Archive -Path "$TempStage\*" -DestinationPath $ZipPath -Force
+$ItemsToZip = (Get-ChildItem -Path $TempStage).FullName
+Compress-Archive -Path $ItemsToZip -DestinationPath $ZipPath -Force
 Remove-Item -Recurse -Force $TempStage
 
 Write-Host "==> Windows package created successfully: $ZipPath"
