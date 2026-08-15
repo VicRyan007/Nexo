@@ -1,4 +1,4 @@
-﻿name: Release
+name: Release
 
 on:
   push:
@@ -10,44 +10,40 @@ permissions:
 
 jobs:
   build-release:
-    name: Build (${{ matrix.target }})
+    name: Build (${{ matrix.os }})
     strategy:
       matrix:
         include:
           - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: nexo-windows-x86_64.zip
-            binary: target/release/nexo.exe
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact: nexo-linux-x86_64.tar.gz
-            binary: target/release/nexo
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+
       - name: Install Linux Build Dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libfontconfig1-dev libxkbcommon-dev
-      - name: Build Release Binary
-        run: cargo build --release -p nexo-app
+          sudo apt-get install -y build-essential pkg-config libv4l-dev libasound2-dev libfontconfig1-dev libxkbcommon-dev libx11-dev libxext-dev libxrandr-dev libxi-dev libxcursor-dev
+
       - name: Package Windows Artifact
         if: runner.os == 'Windows'
         run: |
-          mkdir dist
-          Compress-Archive -Path target/release/nexo.exe, README.md -DestinationPath dist/${{ matrix.artifact }}
+          powershell -ExecutionPolicy Bypass -File ./scripts/package-windows.ps1 -Version "${{ github.ref_name }}" -OutDir "dist"
+
       - name: Package Linux Artifact
         if: runner.os == 'Linux'
         run: |
-          mkdir dist
-          tar -czf dist/${{ matrix.artifact }} -C target/release nexo README.md
           chmod +x scripts/package-linux.sh
           ./scripts/package-linux.sh "${{ github.ref_name }}" dist
+
       - name: Upload Release Artifacts
         uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
         with:
           files: dist/*
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

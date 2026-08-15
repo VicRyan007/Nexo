@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 VERSION="${1:-0.1.0}"
@@ -19,7 +19,11 @@ fi
 # 1. Tarball
 TAR_NAME="nexo-${VERSION}-linux-x86_64.tar.gz"
 echo "==> Creating Linux tarball: ${OUT_DIR}/${TAR_NAME}..."
-tar -czf "${OUT_DIR}/${TAR_NAME}" -C target/release nexo -C ../../ README.md
+STAGE_DIR=$(mktemp -d)
+cp "$BINARY" "${STAGE_DIR}/nexo"
+cp README.md "${STAGE_DIR}/README.md"
+tar -czf "${OUT_DIR}/${TAR_NAME}" -C "${STAGE_DIR}" nexo README.md
+rm -rf "${STAGE_DIR}"
 
 # 2. Debian package (.deb)
 DEB_STAGE=$(mktemp -d)
