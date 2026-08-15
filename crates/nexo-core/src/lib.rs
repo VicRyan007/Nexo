@@ -3,6 +3,7 @@ pub mod election;
 pub mod file_transfer;
 pub mod identity;
 pub mod invite;
+pub mod markdown;
 pub mod media_crypto;
 pub mod membership;
 pub mod message;
@@ -21,6 +22,7 @@ pub use file_transfer::{
 };
 pub use identity::{DeviceIdentity, IdentityError};
 pub use invite::{InviteError, NetworkInvite, current_timestamp};
+pub use markdown::{FormattedSegment, parse_markdown, replace_emoji_shortcodes};
 pub use media_crypto::{MediaCryptoError, MediaFrameCipher};
 pub use membership::{CommunityCredential, MembershipError, community_sync_token, peer_sync_token};
 pub use message::{MessageError, SignedMessage};

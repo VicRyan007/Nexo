@@ -244,6 +244,28 @@ fn bind_actions(app: &AppWindow, state: &Rc<RefCell<AppState>>) {
         }
     });
 
+    let weak = app.as_weak();
+    let _action_state = Rc::clone(state);
+    app.on_attach_file(move || {
+        if let Some(app) = weak.upgrade() {
+            set_result_status(&app, "Seletor de arquivos P2P pronto");
+        }
+    });
+
+    let weak = app.as_weak();
+    let _action_state = Rc::clone(state);
+    app.on_toggle_voice_recording(move || {
+        if let Some(app) = weak.upgrade() {
+            let is_recording = app.get_is_recording_voice();
+            app.set_is_recording_voice(!is_recording);
+            if is_recording {
+                set_result_status(&app, "Nota de voz enviada");
+            } else {
+                set_result_status(&app, "Gravando nota de voz...");
+            }
+        }
+    });
+
     bind_call_actions(app, state);
 }
 
@@ -458,11 +480,12 @@ fn send_message(state: &Rc<RefCell<AppState>>, body: &str) -> Result<()> {
         .as_ref()
         .context("nenhuma comunidade selecionada")?;
     let now = current_timestamp();
+    let processed_body = nexo_core::replace_emoji_shortcodes(body);
     let message = SignedMessage::create(
         &state.identity,
         community.id,
         community.default_channel_id,
-        body.to_owned(),
+        processed_body,
         now,
     )?;
     state.store.insert_message(&message, now)?;

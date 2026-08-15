@@ -48,11 +48,14 @@ export component AppWindow inherits Window {
     in-out property <[ParticipantRow]> participants: [];
     in-out property <[CommunityRow]> communities: [];
     in-out property <[MessageRow]> messages: [];
+    in-out property <bool> is-recording-voice: false;
 
     callback create-network(string);
     callback join-network(string);
     callback select-community(string);
     callback send-message(string) -> bool;
+    callback attach-file();
+    callback toggle-voice-recording();
     callback join-call();
     callback set-muted(bool);
     callback toggle-video();
@@ -375,6 +378,16 @@ export component AppWindow inherits Window {
                     HorizontalBox {
                         height: 42px;
                         spacing: 8px;
+                        Button {
+                            width: 38px;
+                            text: "+";
+                            clicked => { root.attach-file(); }
+                        }
+                        Button {
+                            width: 70px;
+                            text: root.is-recording-voice ? "Gravando" : "Voz";
+                            clicked => { root.toggle-voice-recording(); }
+                        }
                         composer := LineEdit { horizontal-stretch: 1; placeholder-text: "Mensagem para #geral"; }
                         Button {
                             text: "Enviar";
