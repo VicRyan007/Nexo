@@ -9,14 +9,17 @@ rust-version.workspace = true
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 cpal.workspace = true
 if-addrs.workspace = true
+openh264.workspace = true
 rtc.workspace = true
 rusty-opus.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 webrtc.workspace = true
+nexo-core = { path = "../nexo-core" }
 nexo-video = { path = "../nexo-video" }
 uuid.workspace = true
 

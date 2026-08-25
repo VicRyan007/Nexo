@@ -15,7 +15,9 @@ jobs:
       matrix:
         include:
           - os: windows-latest
+            artifact: nexo-windows-x86_64
           - os: ubuntu-latest
+            artifact: nexo-linux-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -25,7 +27,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libv4l-dev libasound2-dev libfontconfig1-dev libxkbcommon-dev libx11-dev libxext-dev libxrandr-dev libxi-dev libxcursor-dev
+          sudo apt-get install -y build-essential pkg-config libclang-dev libpipewire-0.3-dev libspa-0.2-dev libv4l-dev libasound2-dev libfontconfig1-dev libxkbcommon-dev libx11-dev libxext-dev libxrandr-dev libxi-dev libxcursor-dev dpkg-dev
 
       - name: Package Windows Artifact
         if: runner.os == 'Windows'
@@ -38,12 +40,30 @@ jobs:
           chmod +x scripts/package-linux.sh
           ./scripts/package-linux.sh "${{ github.ref_name }}" dist
 
-      - name: Upload Release Artifacts
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: build-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: nexo-*
+          path: dist
+          merge-multiple: true
+      - name: Publish Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: dist/*
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

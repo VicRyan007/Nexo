@@ -20,10 +20,10 @@ fn main() {
             .arg(&res_file)
             .status();
 
-        if let Ok(s) = status {
-            if s.success() {
-                println!("cargo:rustc-link-arg-bins={}", res_file.display());
-            }
+        if let Ok(s) = status
+            && s.success()
+        {
+            println!("cargo:rustc-link-arg-bins={}", res_file.display());
         }
     }
 }

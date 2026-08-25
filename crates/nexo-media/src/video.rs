@@ -12,6 +12,8 @@ use std::time::Duration;
 pub enum VideoCodec {
     /// Google VP8, produced by the software libvpx encoder.
     Vp8,
+    /// H.264 access units produced by a native hardware encoder.
+    H264,
 }
 
 /// One encoded video access unit.
@@ -22,7 +24,7 @@ pub struct EncodedVideoFrame {
     pub height: u32,
     /// Media timestamp in seconds since the stream started.
     pub timestamp: Duration,
-    /// Raw VP8 frame bytes (intra-frame for keyframes, inter-frame otherwise).
+    /// Raw codec bytes (Annex-B for H.264, raw frame for VP8).
     pub data: Box<[u8]>,
     /// Whether this frame is a keyframe (decodes without any reference frame).
     pub is_keyframe: bool,
@@ -33,5 +35,8 @@ pub struct EncodedVideoFrame {
 pub struct ReceivedVideoPacket {
     /// Sequence number of the last RTP packet of the access unit.
     pub sequence_number: u16,
+    /// Stable negotiated track id. A relay keeps publishers separated by
+    /// forwarding each source to its own pre-negotiated video slot.
+    pub track_id: String,
     pub frame: EncodedVideoFrame,
 }

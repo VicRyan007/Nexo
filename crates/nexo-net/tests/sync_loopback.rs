@@ -69,7 +69,10 @@ async fn two_nodes_exchange_a_signed_batch_over_loopback() {
         vec![CommunitySync {
             community_id: invite.network_id,
             credentials: vec![alice_credential, bob_credential],
+            channels: Vec::new(),
             messages: vec![message.clone()],
+            direct_messages: Vec::new(),
+            mls_commits: Vec::new(),
             has_more: false,
         }],
     );
@@ -98,6 +101,8 @@ async fn two_nodes_exchange_a_signed_batch_over_loopback() {
                 vec![CommunityAck {
                     community_id: invite.network_id,
                     processed_message_ids: vec![communities[0].messages[0].id],
+                    processed_direct_message_ids: Vec::new(),
+                    processed_mls_commit_ids: Vec::new(),
                     request_next: false,
                 }],
             ),

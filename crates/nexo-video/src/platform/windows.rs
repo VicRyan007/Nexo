@@ -22,7 +22,18 @@
 //! Safe callers never see a raw pointer, so the rest of the crate (and
 //! workspace) stays `unsafe`-free.
 
-use std::time::{Duration, Instant};
+#![allow(clippy::inline_always, clippy::ref_as_ptr)]
+
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, SyncSender, TrySendError},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
 
 use windows::Graphics::Capture::{
     Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
@@ -42,31 +53,41 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SA
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ADAPTER_DESC1, IDXGIDevice, IDXGIFactory1,
 };
+
+const SCREEN_FRAME_POLL_INTERVAL: Duration = Duration::from_millis(16);
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
 };
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFAttributes, IMFMediaType, IMFSample, IMFSourceReader,
-    MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
-    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
-    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE,
-    MF_MT_SUBTYPE, MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READERF_ENDOFSTREAM, MF_VERSION,
-    MFCreateAttributes, MFCreateDeviceSource, MFCreateMediaType,
-    MFCreateSourceReaderFromMediaSource, MFEnumDeviceSources, MFMediaType_Video,
-    MFSTARTUP_NOSOCKET, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE,
-    MFT_ENUM_FLAG_SORTANDFILTER, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264,
+    IMFActivate, IMFAsyncCallback, IMFAsyncCallback_Impl, IMFAsyncResult, IMFAttributes,
+    IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFSourceReader, IMFTransform,
+    METransformHaveOutput, METransformNeedInput, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
+    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, MF_E_NOTACCEPTING,
+    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+    MF_SOURCE_READERF_ENDOFSTREAM, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
+    MFASYNC_CALLBACK_QUEUE_STANDARD, MFCreateAttributes, MFCreateDeviceSource, MFCreateMediaType,
+    MFCreateMemoryBuffer, MFCreateSample, MFCreateSourceReaderFromMediaSource, MFEnumDeviceSources,
+    MFMediaType_Video, MFSTARTUP_NOSOCKET, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER,
+    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264,
     MFVideoFormat_HEVC, MFVideoFormat_MJPG, MFVideoFormat_NV12, MFVideoFormat_YUY2,
+    MFVideoInterlace_Progressive,
 };
 use windows::Win32::System::Com::{
     COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::System::WinRT::RoGetActivationFactory;
-use windows::core::{BOOL, GUID, HSTRING, Interface, PCWSTR, PWSTR};
+use windows::core::{
+    BOOL, GUID, HSTRING, IUnknown, Interface, PWSTR, Ref, Result as WindowsResult, implement,
+};
 
 use crate::capture::{PixelFormat, VideoFrame};
 use crate::devices::{VideoDeviceInfo, VideoError};
@@ -77,6 +98,33 @@ const NV12_INPUT: MFT_REGISTER_TYPE_INFO = MFT_REGISTER_TYPE_INFO {
     guidMajorType: MFMediaType_Video,
     guidSubtype: MFVideoFormat_NV12,
 };
+
+/// A complete H.264 access unit returned by the Windows MFT encoder.
+pub(crate) struct NativeEncodedH264Frame {
+    pub(crate) timestamp: Duration,
+    pub(crate) data: Box<[u8]>,
+    pub(crate) is_keyframe: bool,
+}
+
+/// Synchronous hardware H.264 encoder backed by a hardware Media Foundation
+/// transform. It owns the COM/MF session so the encoder can safely live on the
+/// media worker thread without relying on global initialization order.
+pub(crate) struct HardwareH264Encoder {
+    backend: H264EncoderBackend,
+}
+
+enum H264EncoderBackend {
+    Synchronous(SynchronousH264Encoder),
+    Asynchronous(AsyncH264Encoder),
+}
+
+struct SynchronousH264Encoder {
+    _session: MediaSession,
+    transform: IMFTransform,
+    width: u32,
+    height: u32,
+    output_size: u32,
+}
 
 /// Stream index selecting the first video stream in a `IMFSourceReader`; the
 /// native constant is a negative sentinel that must be cast to `u32`.
@@ -127,6 +175,826 @@ impl Drop for MediaSession {
                 CoUninitialize();
             }
         }
+    }
+}
+
+impl HardwareH264Encoder {
+    pub(crate) fn new(width: u32, height: u32, bitrate_bps: u32) -> Result<Self, VideoError> {
+        match SynchronousH264Encoder::new(width, height, bitrate_bps) {
+            Ok(encoder) => Ok(Self {
+                backend: H264EncoderBackend::Synchronous(encoder),
+            }),
+            Err(synchronous_error) => match AsyncH264Encoder::new(width, height, bitrate_bps) {
+                Ok(encoder) => Ok(Self {
+                    backend: H264EncoderBackend::Asynchronous(encoder),
+                }),
+                Err(async_error) => Err(VideoError::encoder(format!(
+                    "encoder síncrono indisponivel ({synchronous_error}); encoder assíncrono indisponivel ({async_error})"
+                ))),
+            },
+        }
+    }
+
+    pub(crate) fn width(&self) -> u32 {
+        match &self.backend {
+            H264EncoderBackend::Synchronous(encoder) => encoder.width(),
+            H264EncoderBackend::Asynchronous(encoder) => encoder.width,
+        }
+    }
+
+    pub(crate) fn height(&self) -> u32 {
+        match &self.backend {
+            H264EncoderBackend::Synchronous(encoder) => encoder.height(),
+            H264EncoderBackend::Asynchronous(encoder) => encoder.height,
+        }
+    }
+
+    pub(crate) fn encode(
+        &mut self,
+        timestamp: Duration,
+        nv12: &[u8],
+    ) -> Result<Option<NativeEncodedH264Frame>, VideoError> {
+        match &mut self.backend {
+            H264EncoderBackend::Synchronous(encoder) => encoder.encode(timestamp, nv12),
+            H264EncoderBackend::Asynchronous(encoder) => encoder.encode(timestamp, nv12),
+        }
+    }
+}
+
+impl SynchronousH264Encoder {
+    pub(crate) fn new(width: u32, height: u32, bitrate_bps: u32) -> Result<Self, VideoError> {
+        unsafe {
+            let (session, transform) = activate_h264_transform(false)?;
+
+            let input_type = encoder_media_type(MFVideoFormat_NV12, width, height, bitrate_bps)?;
+            let output_type = encoder_media_type(MFVideoFormat_H264, width, height, bitrate_bps)?;
+            transform
+                .SetOutputType(0, &output_type, 0)
+                .map_err(|error| VideoError::platform(format!("SetOutputType H.264: {error}")))?;
+            transform
+                .SetInputType(0, &input_type, 0)
+                .map_err(|error| VideoError::platform(format!("SetInputType H.264: {error}")))?;
+            transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
+                .map_err(|error| VideoError::platform(format!("begin H.264 stream: {error}")))?;
+            transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
+                .map_err(|error| VideoError::platform(format!("start H.264 stream: {error}")))?;
+            let stream_info = transform
+                .GetOutputStreamInfo(0)
+                .map_err(|error| VideoError::platform(format!("H.264 output info: {error}")))?;
+            let minimum_output = width
+                .saturating_mul(height)
+                .saturating_div(2)
+                .max(64 * 1024);
+            let output_size = stream_info.cbSize.max(minimum_output);
+            Ok(Self {
+                _session: session,
+                transform,
+                width,
+                height,
+                output_size,
+            })
+        }
+    }
+
+    pub(crate) fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub(crate) fn height(&self) -> u32 {
+        self.height
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn encode(
+        &mut self,
+        timestamp: Duration,
+        nv12: &[u8],
+    ) -> Result<Option<NativeEncodedH264Frame>, VideoError> {
+        unsafe {
+            let input_len = u32::try_from(nv12.len()).map_err(|_| {
+                VideoError::platform("frame NV12 excede o limite do Media Foundation")
+            })?;
+            let input_sample = MFCreateSample()
+                .map_err(|error| VideoError::platform(format!("MFCreateSample input: {error}")))?;
+            let input_buffer = MFCreateMemoryBuffer(input_len).map_err(|error| {
+                VideoError::platform(format!("MFCreateMemoryBuffer input: {error}"))
+            })?;
+            let mut target = std::ptr::null_mut();
+            let mut max_length = 0u32;
+            let mut current_length = 0u32;
+            input_buffer
+                .Lock(
+                    std::ptr::addr_of_mut!(target),
+                    Some(std::ptr::addr_of_mut!(max_length)),
+                    Some(std::ptr::addr_of_mut!(current_length)),
+                )
+                .map_err(|error| VideoError::platform(format!("Lock input H.264: {error}")))?;
+            let copy_result = if max_length < input_len || target.is_null() {
+                Err(VideoError::platform(
+                    "buffer NV12 do Media Foundation e invalido",
+                ))
+            } else {
+                std::ptr::copy_nonoverlapping(nv12.as_ptr(), target, nv12.len());
+                Ok(())
+            };
+            let unlock_result = input_buffer
+                .Unlock()
+                .map_err(|error| VideoError::platform(format!("Unlock input H.264: {error}")));
+            copy_result?;
+            unlock_result?;
+            input_buffer.SetCurrentLength(input_len).map_err(|error| {
+                VideoError::platform(format!("SetCurrentLength H.264: {error}"))
+            })?;
+            input_sample
+                .AddBuffer(&input_buffer)
+                .map_err(|error| VideoError::platform(format!("AddBuffer H.264: {error}")))?;
+            input_sample
+                .SetSampleTime(duration_to_hns(timestamp))
+                .map_err(|error| VideoError::platform(format!("SetSampleTime H.264: {error}")))?;
+            input_sample.SetSampleDuration(333_333).map_err(|error| {
+                VideoError::platform(format!("SetSampleDuration H.264: {error}"))
+            })?;
+            self.transform
+                .ProcessInput(0, &input_sample, 0)
+                .map_err(|error| VideoError::platform(format!("ProcessInput H.264: {error}")))?;
+
+            let stream_info = self
+                .transform
+                .GetOutputStreamInfo(0)
+                .map_err(|error| VideoError::platform(format!("H.264 output info: {error}")))?;
+            let provides_samples =
+                stream_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0;
+            let output_sample = if provides_samples {
+                None
+            } else {
+                let sample = MFCreateSample().map_err(|error| {
+                    VideoError::platform(format!("MFCreateSample output: {error}"))
+                })?;
+                let buffer = MFCreateMemoryBuffer(self.output_size).map_err(|error| {
+                    VideoError::platform(format!("MFCreateMemoryBuffer output: {error}"))
+                })?;
+                sample.AddBuffer(&buffer).map_err(|error| {
+                    VideoError::platform(format!("AddBuffer output H.264: {error}"))
+                })?;
+                Some(sample)
+            };
+            let mut output = MFT_OUTPUT_DATA_BUFFER {
+                dwStreamID: 0,
+                pSample: std::mem::ManuallyDrop::new(output_sample),
+                dwStatus: 0,
+                pEvents: std::mem::ManuallyDrop::new(None),
+            };
+            let mut status = 0u32;
+            let process_result =
+                self.transform
+                    .ProcessOutput(0, std::slice::from_mut(&mut output), &raw mut status);
+            let sample = std::mem::ManuallyDrop::take(&mut output.pSample);
+            let _events = std::mem::ManuallyDrop::take(&mut output.pEvents);
+            if let Err(error) = process_result {
+                if error.code()
+                    == windows::Win32::Media::MediaFoundation::MF_E_TRANSFORM_NEED_MORE_INPUT
+                {
+                    return Ok(None);
+                }
+                return Err(VideoError::platform(format!(
+                    "ProcessOutput H.264: {error}"
+                )));
+            }
+            let Some(sample) = sample else {
+                return Ok(None);
+            };
+            let buffer = sample.ConvertToContiguousBuffer().map_err(|error| {
+                VideoError::platform(format!("ConvertToContiguousBuffer H.264: {error}"))
+            })?;
+            let mut pointer = std::ptr::null_mut();
+            let mut max_length = 0u32;
+            let mut current_length = 0u32;
+            buffer
+                .Lock(
+                    std::ptr::addr_of_mut!(pointer),
+                    Some(std::ptr::addr_of_mut!(max_length)),
+                    Some(std::ptr::addr_of_mut!(current_length)),
+                )
+                .map_err(|error| VideoError::platform(format!("Lock output H.264: {error}")))?;
+            let data = if pointer.is_null() || current_length > max_length {
+                Err(VideoError::platform("buffer H.264 retornado e invalido"))
+            } else {
+                Ok(std::slice::from_raw_parts(pointer, current_length as usize).to_vec())
+            };
+            let unlock_result = buffer
+                .Unlock()
+                .map_err(|error| VideoError::platform(format!("Unlock output H.264: {error}")));
+            let data = data?;
+            unlock_result?;
+            if data.is_empty() {
+                return Ok(None);
+            }
+            let is_keyframe = h264_contains_idr(&data);
+            Ok(Some(NativeEncodedH264Frame {
+                timestamp,
+                data: normalize_h264_access_unit(&data).into_boxed_slice(),
+                is_keyframe,
+            }))
+        }
+    }
+}
+
+/// State shared with the Media Foundation callback. The callback only wakes
+/// the encoder thread; all COM calls remain serialized on that thread.
+#[allow(clippy::inline_always, clippy::ref_as_ptr)]
+#[implement(IMFAsyncCallback)]
+struct AsyncMftCallback {
+    generator: IMFMediaEventGenerator,
+    event_types: Arc<Mutex<Vec<u32>>>,
+}
+
+// Media Foundation can invoke the callback on its work-queue thread. The MFT
+// event generator is documented as the callback's paired, thread-safe source;
+// the actual transform processing remains serialized by the owning worker.
+unsafe impl Send for AsyncMftCallback {}
+unsafe impl Sync for AsyncMftCallback {}
+
+#[allow(non_snake_case)]
+impl IMFAsyncCallback_Impl for AsyncMftCallback_Impl {
+    fn GetParameters(&self, flags: *mut u32, queue: *mut u32) -> WindowsResult<()> {
+        unsafe {
+            if !flags.is_null() {
+                *flags = 0;
+            }
+            if !queue.is_null() {
+                *queue = MFASYNC_CALLBACK_QUEUE_STANDARD;
+            }
+        }
+        Ok(())
+    }
+
+    fn Invoke(&self, result: Ref<IMFAsyncResult>) -> WindowsResult<()> {
+        let event = unsafe { self.generator.EndGetEvent(result.ok()?)? };
+        let event_type = unsafe { event.GetType()? };
+        if let Ok(mut events) = self.event_types.lock() {
+            events.push(event_type);
+        }
+        Ok(())
+    }
+}
+
+struct AsyncEncodeCommand {
+    timestamp: Duration,
+    nv12: Vec<u8>,
+}
+
+struct AsyncH264Encoder {
+    sender: SyncSender<AsyncEncodeCommand>,
+    latest: Arc<Mutex<Option<Result<NativeEncodedH264Frame, VideoError>>>>,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+    width: u32,
+    height: u32,
+}
+
+impl AsyncH264Encoder {
+    fn new(width: u32, height: u32, bitrate_bps: u32) -> Result<Self, VideoError> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let latest = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_latest = Arc::clone(&latest);
+        let thread_stop = Arc::clone(&stop);
+        let (startup_sender, startup_receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("nexo-h264-mft".to_owned())
+            .spawn(move || {
+                let initialized =
+                    unsafe { initialize_async_h264_encoder(width, height, bitrate_bps) };
+                let (session, transform, output_size) = match initialized {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = startup_sender.send(Err(error));
+                        return;
+                    }
+                };
+                let event_types = Arc::new(Mutex::new(Vec::new()));
+                let generator = match transform.cast::<IMFMediaEventGenerator>() {
+                    Ok(generator) => generator,
+                    Err(error) => {
+                        let _ = startup_sender.send(Err(VideoError::encoder(format!(
+                            "IMFMediaEventGenerator indisponivel: {error}"
+                        ))));
+                        return;
+                    }
+                };
+                let callback: IMFAsyncCallback = AsyncMftCallback {
+                    generator: generator.clone(),
+                    event_types: Arc::clone(&event_types),
+                }
+                .into();
+                let registration = unsafe { generator.BeginGetEvent(&callback, None::<&IUnknown>) };
+                if let Err(error) = registration {
+                    let _ = startup_sender.send(Err(VideoError::encoder(format!(
+                        "BeginGetEvent H.264: {error}"
+                    ))));
+                    return;
+                }
+                if startup_sender.send(Ok(())).is_err() {
+                    return;
+                }
+                if let Err(error) = run_async_h264_encoder(
+                    &transform,
+                    &generator,
+                    &callback,
+                    &event_types,
+                    output_size,
+                    &receiver,
+                    &thread_stop,
+                    &thread_latest,
+                ) && let Ok(mut latest) = thread_latest.lock()
+                {
+                    *latest = Some(Err(error));
+                }
+                let _ = session;
+            })
+            .map_err(|error| VideoError::encoder(format!("thread H.264 assíncrono: {error}")))?;
+
+        match startup_receiver.recv() {
+            Ok(Ok(())) => Ok(Self {
+                sender,
+                latest,
+                stop,
+                worker: Some(worker),
+                width,
+                height,
+            }),
+            Ok(Err(error)) => {
+                let _ = worker.join();
+                Err(error)
+            }
+            Err(_) => {
+                let _ = worker.join();
+                Err(VideoError::encoder(
+                    "thread H.264 assíncrono encerrou durante a inicialização",
+                ))
+            }
+        }
+    }
+
+    fn encode(
+        &mut self,
+        timestamp: Duration,
+        nv12: &[u8],
+    ) -> Result<Option<NativeEncodedH264Frame>, VideoError> {
+        let expected = usize::try_from(self.width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(self.height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|y| y.checked_add(y / 2))
+            .ok_or_else(|| VideoError::encoder("tamanho NV12 excede os limites"))?;
+        if nv12.len() != expected {
+            return Err(VideoError::encoder(format!(
+                "frame NV12 tem {} bytes, esperado {expected}",
+                nv12.len()
+            )));
+        }
+
+        let previous = self
+            .latest
+            .lock()
+            .map_err(|_| VideoError::encoder("estado do encoder H.264 indisponivel"))?
+            .take();
+        let previous_frame = match previous {
+            Some(Ok(frame)) => Some(frame),
+            Some(Err(error)) => return Err(error),
+            None => None,
+        };
+
+        match self.sender.try_send(AsyncEncodeCommand {
+            timestamp,
+            nv12: nv12.to_vec(),
+        }) {
+            Ok(()) | Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {
+                return Err(VideoError::encoder("thread H.264 assíncrono desconectado"));
+            }
+        }
+        let current_frame = self
+            .latest
+            .lock()
+            .map_err(|_| VideoError::encoder("estado do encoder H.264 indisponivel"))?
+            .take()
+            .transpose()?;
+        Ok(current_frame.or(previous_frame))
+    }
+}
+
+impl Drop for AsyncH264Encoder {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+unsafe fn initialize_async_h264_encoder(
+    width: u32,
+    height: u32,
+    bitrate_bps: u32,
+) -> Result<(MediaSession, IMFTransform, u32), VideoError> {
+    unsafe {
+        let (session, transform) = activate_h264_transform(true)?;
+        transform
+            .GetAttributes()
+            .map_err(|error| VideoError::platform(format!("atributos H.264 assíncrono: {error}")))?
+            .SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)
+            .map_err(|error| {
+                VideoError::platform(format!("desbloqueio H.264 assíncrono: {error}"))
+            })?;
+        let input_type = encoder_media_type(MFVideoFormat_NV12, width, height, bitrate_bps)?;
+        let output_type = encoder_media_type(MFVideoFormat_H264, width, height, bitrate_bps)?;
+        transform
+            .SetOutputType(0, &output_type, 0)
+            .map_err(|error| VideoError::platform(format!("SetOutputType H.264: {error}")))?;
+        transform
+            .SetInputType(0, &input_type, 0)
+            .map_err(|error| VideoError::platform(format!("SetInputType H.264: {error}")))?;
+        transform
+            .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
+            .map_err(|error| VideoError::platform(format!("begin H.264 stream: {error}")))?;
+        transform
+            .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
+            .map_err(|error| VideoError::platform(format!("start H.264 stream: {error}")))?;
+        let stream_info = transform
+            .GetOutputStreamInfo(0)
+            .map_err(|error| VideoError::platform(format!("H.264 output info: {error}")))?;
+        let minimum_output = width
+            .saturating_mul(height)
+            .saturating_div(2)
+            .max(64 * 1024);
+        Ok((session, transform, stream_info.cbSize.max(minimum_output)))
+    }
+}
+
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+fn run_async_h264_encoder(
+    transform: &IMFTransform,
+    generator: &IMFMediaEventGenerator,
+    callback: &IMFAsyncCallback,
+    event_types: &Arc<Mutex<Vec<u32>>>,
+    output_size: u32,
+    receiver: &Receiver<AsyncEncodeCommand>,
+    stop: &AtomicBool,
+    latest: &Arc<Mutex<Option<Result<NativeEncodedH264Frame, VideoError>>>>,
+) -> Result<(), VideoError> {
+    let mut pending_input = None;
+    let mut input_timestamps = VecDeque::new();
+    let mut accepts_input = false;
+    let mut pending_outputs = 0_usize;
+
+    while !stop.load(Ordering::Acquire) {
+        if pending_input.is_none() {
+            match receiver.recv_timeout(Duration::from_millis(1)) {
+                Ok(command) => pending_input = Some(command),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+
+        let received_events = event_types
+            .lock()
+            .map_err(|_| VideoError::encoder("fila de eventos H.264 indisponivel"))?
+            .drain(..)
+            .collect::<Vec<_>>();
+        if !received_events.is_empty() {
+            for event_type in received_events {
+                if event_type == METransformNeedInput.0 as u32 {
+                    accepts_input = true;
+                } else if event_type == METransformHaveOutput.0 as u32 {
+                    pending_outputs = pending_outputs.saturating_add(1);
+                }
+            }
+            unsafe { generator.BeginGetEvent(callback, None::<&IUnknown>) }
+                .map_err(|error| VideoError::encoder(format!("BeginGetEvent H.264: {error}")))?;
+        }
+
+        if accepts_input && let Some(command) = pending_input.take() {
+            let timestamp = command.timestamp;
+            let sample = unsafe { make_h264_input_sample(timestamp, &command.nv12)? };
+            match unsafe { transform.ProcessInput(0, &sample, 0) } {
+                Ok(()) => {
+                    input_timestamps.push_back(timestamp);
+                    accepts_input = false;
+                }
+                Err(error) if error.code() == MF_E_NOTACCEPTING => {
+                    pending_input = Some(command);
+                    accepts_input = false;
+                }
+                Err(error) => {
+                    return Err(VideoError::encoder(format!("ProcessInput H.264: {error}")));
+                }
+            }
+        }
+
+        if pending_outputs > 0 {
+            pending_outputs -= 1;
+            let timestamp = input_timestamps.pop_front().unwrap_or(Duration::ZERO);
+            let _ = unsafe { drain_async_h264_output(transform, output_size, timestamp, latest) }?;
+        }
+    }
+    let _ = unsafe { transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0) };
+    Ok(())
+}
+
+unsafe fn make_h264_input_sample(
+    timestamp: Duration,
+    nv12: &[u8],
+) -> Result<IMFSample, VideoError> {
+    unsafe {
+        let input_len = u32::try_from(nv12.len())
+            .map_err(|_| VideoError::platform("frame NV12 excede o limite do Media Foundation"))?;
+        let input_sample = MFCreateSample()
+            .map_err(|error| VideoError::platform(format!("MFCreateSample input: {error}")))?;
+        let input_buffer = MFCreateMemoryBuffer(input_len).map_err(|error| {
+            VideoError::platform(format!("MFCreateMemoryBuffer input: {error}"))
+        })?;
+        let mut target = std::ptr::null_mut();
+        let mut max_length = 0u32;
+        let mut current_length = 0u32;
+        input_buffer
+            .Lock(
+                std::ptr::addr_of_mut!(target),
+                Some(std::ptr::addr_of_mut!(max_length)),
+                Some(std::ptr::addr_of_mut!(current_length)),
+            )
+            .map_err(|error| VideoError::platform(format!("Lock input H.264: {error}")))?;
+        let copy_result = if max_length < input_len || target.is_null() {
+            Err(VideoError::platform(
+                "buffer NV12 do Media Foundation e invalido",
+            ))
+        } else {
+            std::ptr::copy_nonoverlapping(nv12.as_ptr(), target, nv12.len());
+            Ok(())
+        };
+        let unlock_result = input_buffer
+            .Unlock()
+            .map_err(|error| VideoError::platform(format!("Unlock input H.264: {error}")));
+        copy_result?;
+        unlock_result?;
+        input_buffer
+            .SetCurrentLength(input_len)
+            .map_err(|error| VideoError::platform(format!("SetCurrentLength H.264: {error}")))?;
+        input_sample
+            .AddBuffer(&input_buffer)
+            .map_err(|error| VideoError::platform(format!("AddBuffer H.264: {error}")))?;
+        input_sample
+            .SetSampleTime(duration_to_hns(timestamp))
+            .map_err(|error| VideoError::platform(format!("SetSampleTime H.264: {error}")))?;
+        input_sample
+            .SetSampleDuration(333_333)
+            .map_err(|error| VideoError::platform(format!("SetSampleDuration H.264: {error}")))?;
+        Ok(input_sample)
+    }
+}
+
+unsafe fn drain_async_h264_output(
+    transform: &IMFTransform,
+    output_size: u32,
+    timestamp: Duration,
+    latest: &Arc<Mutex<Option<Result<NativeEncodedH264Frame, VideoError>>>>,
+) -> Result<bool, VideoError> {
+    unsafe {
+        let stream_info = transform
+            .GetOutputStreamInfo(0)
+            .map_err(|error| VideoError::platform(format!("H.264 output info: {error}")))?;
+        let provides_samples =
+            stream_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0;
+        let output_sample = if provides_samples {
+            None
+        } else {
+            let sample = MFCreateSample()
+                .map_err(|error| VideoError::platform(format!("MFCreateSample output: {error}")))?;
+            let buffer = MFCreateMemoryBuffer(output_size).map_err(|error| {
+                VideoError::platform(format!("MFCreateMemoryBuffer output: {error}"))
+            })?;
+            sample.AddBuffer(&buffer).map_err(|error| {
+                VideoError::platform(format!("AddBuffer output H.264: {error}"))
+            })?;
+            Some(sample)
+        };
+        let mut output = MFT_OUTPUT_DATA_BUFFER {
+            dwStreamID: 0,
+            pSample: std::mem::ManuallyDrop::new(output_sample),
+            dwStatus: 0,
+            pEvents: std::mem::ManuallyDrop::new(None),
+        };
+        let mut status = 0u32;
+        let process_result = transform.ProcessOutput(
+            0,
+            std::slice::from_mut(&mut output),
+            std::ptr::addr_of_mut!(status),
+        );
+        let sample = std::mem::ManuallyDrop::take(&mut output.pSample);
+        let _events = std::mem::ManuallyDrop::take(&mut output.pEvents);
+        if let Err(error) = process_result {
+            if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT
+                || error.code() == MF_E_TRANSFORM_STREAM_CHANGE
+            {
+                return Ok(false);
+            }
+            return Err(VideoError::platform(format!(
+                "ProcessOutput H.264: {error}"
+            )));
+        }
+        let Some(sample) = sample else {
+            return Ok(false);
+        };
+        let buffer = sample.ConvertToContiguousBuffer().map_err(|error| {
+            VideoError::platform(format!("ConvertToContiguousBuffer H.264: {error}"))
+        })?;
+        let mut pointer = std::ptr::null_mut();
+        let mut max_length = 0u32;
+        let mut current_length = 0u32;
+        buffer
+            .Lock(
+                std::ptr::addr_of_mut!(pointer),
+                Some(std::ptr::addr_of_mut!(max_length)),
+                Some(std::ptr::addr_of_mut!(current_length)),
+            )
+            .map_err(|error| VideoError::platform(format!("Lock output H.264: {error}")))?;
+        let data = if pointer.is_null() || current_length > max_length {
+            Err(VideoError::platform("buffer H.264 retornado e invalido"))
+        } else {
+            Ok(std::slice::from_raw_parts(pointer, current_length as usize).to_vec())
+        };
+        let unlock_result = buffer
+            .Unlock()
+            .map_err(|error| VideoError::platform(format!("Unlock output H.264: {error}")));
+        let data = data?;
+        unlock_result?;
+        if data.is_empty() {
+            return Ok(false);
+        }
+        let frame = NativeEncodedH264Frame {
+            timestamp,
+            is_keyframe: h264_contains_idr(&data),
+            data: normalize_h264_access_unit(&data).into_boxed_slice(),
+        };
+        if let Ok(mut output) = latest.lock() {
+            *output = Some(Ok(frame));
+        }
+        Ok(true)
+    }
+}
+
+fn duration_to_hns(duration: Duration) -> i64 {
+    i64::try_from(duration.as_nanos() / 100).unwrap_or(i64::MAX)
+}
+
+unsafe fn activate_h264_transform(
+    asynchronous: bool,
+) -> Result<(MediaSession, IMFTransform), VideoError> {
+    unsafe {
+        let session = MediaSession::init()?;
+        let output_info = MFT_REGISTER_TYPE_INFO {
+            guidMajorType: MFMediaType_Video,
+            guidSubtype: MFVideoFormat_H264,
+        };
+        let input_info = NV12_INPUT;
+        let mut raw_devices: *mut Option<IMFActivate> = std::ptr::null_mut();
+        let mut count = 0u32;
+        MFTEnumEx(
+            MFT_CATEGORY_VIDEO_ENCODER,
+            MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+            Some(std::ptr::addr_of!(input_info)),
+            Some(std::ptr::addr_of!(output_info)),
+            std::ptr::addr_of_mut!(raw_devices),
+            std::ptr::addr_of_mut!(count),
+        )
+        .map_err(|error| VideoError::platform(format!("MFTEnumEx: {error}")))?;
+
+        let mut selected = None;
+        if !raw_devices.is_null() {
+            let devices = std::slice::from_raw_parts_mut(raw_devices, count as usize);
+            for device in devices.iter_mut() {
+                if let Some(activate) = device.take()
+                    && let Ok(transform) = activate.ActivateObject::<IMFTransform>()
+                    && is_async_transform(&transform) == asynchronous
+                {
+                    selected = Some(transform);
+                    break;
+                }
+            }
+        }
+        CoTaskMemFree(Some(raw_devices.cast()));
+        let transform = selected.ok_or_else(|| {
+            if asynchronous {
+                VideoError::unsupported("encoder H.264 assíncrono por hardware")
+            } else {
+                VideoError::unsupported("encoder H.264 síncrono por hardware")
+            }
+        })?;
+        Ok((session, transform))
+    }
+}
+
+fn is_async_transform(transform: &IMFTransform) -> bool {
+    unsafe {
+        transform
+            .GetAttributes()
+            .ok()
+            .and_then(|attributes| {
+                attributes
+                    .GetUINT32(&MF_TRANSFORM_ASYNC)
+                    .ok()
+                    .map(|value| value != 0)
+            })
+            .unwrap_or(false)
+    }
+}
+
+unsafe fn encoder_media_type(
+    subtype: GUID,
+    width: u32,
+    height: u32,
+    bitrate_bps: u32,
+) -> Result<IMFMediaType, VideoError> {
+    unsafe {
+        let media_type = MFCreateMediaType()
+            .map_err(|error| VideoError::platform(format!("MFCreateMediaType encoder: {error}")))?;
+        media_type
+            .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
+            .map_err(|error| VideoError::platform(format!("SetGUID encoder major: {error}")))?;
+        media_type
+            .SetGUID(&MF_MT_SUBTYPE, &raw const subtype)
+            .map_err(|error| VideoError::platform(format!("SetGUID encoder subtype: {error}")))?;
+        media_type
+            .SetUINT64(&MF_MT_FRAME_SIZE, packed_size(width, height))
+            .map_err(|error| VideoError::platform(format!("SetUINT64 encoder size: {error}")))?;
+        media_type
+            .SetUINT64(&MF_MT_FRAME_RATE, packed_size(30, 1))
+            .map_err(|error| VideoError::platform(format!("SetUINT64 encoder rate: {error}")))?;
+        media_type
+            .SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, packed_size(1, 1))
+            .map_err(|error| VideoError::platform(format!("SetUINT64 encoder aspect: {error}")))?;
+        media_type
+            .SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
+            .map_err(|error| {
+                VideoError::platform(format!("SetUINT32 encoder interlace: {error}"))
+            })?;
+        media_type
+            .SetUINT32(&MF_MT_AVG_BITRATE, bitrate_bps.max(128_000))
+            .map_err(|error| VideoError::platform(format!("SetUINT32 encoder bitrate: {error}")))?;
+        Ok(media_type)
+    }
+}
+
+fn h264_contains_idr(data: &[u8]) -> bool {
+    let mut index = 0;
+    while index + 4 < data.len() {
+        let start_len = if data[index..].starts_with(&[0, 0, 0, 1]) {
+            4
+        } else if data[index..].starts_with(&[0, 0, 1]) {
+            3
+        } else {
+            index += 1;
+            continue;
+        };
+        let nal_index = index + start_len;
+        if nal_index < data.len() && data[nal_index] & 0x1f == 5 {
+            return true;
+        }
+        index = nal_index;
+    }
+    false
+}
+
+fn normalize_h264_access_unit(data: &[u8]) -> Vec<u8> {
+    if data.starts_with(&[0, 0, 0, 1]) || data.starts_with(&[0, 0, 1]) {
+        return data.to_vec();
+    }
+    let mut output = Vec::new();
+    let mut offset = 0usize;
+    while offset + 4 <= data.len() {
+        let length = u32::from_be_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]) as usize;
+        offset += 4;
+        if length == 0 || offset + length > data.len() {
+            return data.to_vec();
+        }
+        output.extend_from_slice(&[0, 0, 0, 1]);
+        output.extend_from_slice(&data[offset..offset + length]);
+        offset += length;
+    }
+    if offset == data.len() && !output.is_empty() {
+        output
+    } else {
+        data.to_vec()
     }
 }
 
@@ -579,7 +1447,7 @@ impl ScreenCapture {
                 if self.last_frame_at.elapsed() > Duration::from_secs(5) {
                     return Err(VideoError::screen_capture("captura sem quadros novos"));
                 }
-                std::thread::sleep(Duration::from_millis(5));
+                std::thread::sleep(SCREEN_FRAME_POLL_INTERVAL);
             };
 
             let surface = frame.Surface().map_err(|error| {
@@ -747,7 +1615,21 @@ unsafe fn negotiate_media_type(
             }
         }
 
-        Ok((native_w, native_h, native_format))
+        // A few drivers expose a partially populated frame-size attribute
+        // (for example 3840x0). Never pass that through to the codec: use the
+        // complete requested size instead, which is also the size requested
+        // in the proposed NV12 media type above.
+        let fallback = if native_w > 0 && native_h > 0 {
+            (native_w, native_h)
+        } else {
+            (request_w, request_h)
+        };
+        if fallback.0 == 0 || fallback.1 == 0 {
+            return Err(VideoError::platform(
+                "a camera nao informou uma resolucao valida",
+            ));
+        }
+        Ok((fallback.0, fallback.1, native_format))
     }
 }
 
@@ -799,17 +1681,7 @@ pub(super) fn gpu() -> Option<String> {
 pub(super) fn hardware_video_encoders() -> Vec<CodecCapability> {
     let mut codecs = Vec::new();
 
-    if has_amf_runtime() {
-        codecs.push(CodecCapability {
-            name: "H264".into(),
-            kind: MediaKind::Video,
-            encode: true,
-            decode: false,
-            acceleration: AccelerationApi::AmdAmf,
-        });
-    }
-
-    if has_hardware_mft(&MFVideoFormat_H264) {
+    if has_hardware_mft(&MFVideoFormat_H264, true) {
         codecs.push(CodecCapability {
             name: "H264".into(),
             kind: MediaKind::Video,
@@ -819,7 +1691,7 @@ pub(super) fn hardware_video_encoders() -> Vec<CodecCapability> {
         });
     }
 
-    if has_hardware_mft(&MFVideoFormat_HEVC) {
+    if has_hardware_mft(&MFVideoFormat_HEVC, false) {
         codecs.push(CodecCapability {
             name: "HEVC".into(),
             kind: MediaKind::Video,
@@ -841,14 +1713,6 @@ pub(super) fn capture_backends() -> Vec<CaptureBackend> {
     ]
 }
 
-/// Whether the AMD AMF runtime (`amfrt64.dll`) is already loaded.
-fn has_amf_runtime() -> bool {
-    const AMF_RT64: &[u16] = &[
-        0x61, 0x6d, 0x66, 0x72, 0x74, 0x36, 0x34, 0x2e, 0x64, 0x6c, 0x6c, 0,
-    ];
-    unsafe { GetModuleHandleW(PCWSTR(AMF_RT64.as_ptr())).is_ok_and(|module| !module.is_invalid()) }
-}
-
 /// Whether a hardware MFT video encoder for `subtype` exists.
 ///
 /// # Safety
@@ -856,7 +1720,7 @@ fn has_amf_runtime() -> bool {
 /// Media Foundation is initialized for the duration of the query through
 /// [`MediaSession`]; the returned `IMFActivate` array is released before this
 /// function returns.
-fn has_hardware_mft(subtype: &GUID) -> bool {
+fn has_hardware_mft(subtype: &GUID, allow_async: bool) -> bool {
     unsafe {
         let Ok(_session) = MediaSession::init() else {
             return false;
@@ -882,12 +1746,27 @@ fn has_hardware_mft(subtype: &GUID) -> bool {
             return false;
         }
 
-        let present = count > 0;
-        if present {
+        let mut present = false;
+        if count > 0 {
             let devices = std::slice::from_raw_parts_mut(raw_devices, count as usize);
             for device in devices.iter_mut() {
                 if let Some(activate) = device.take() {
-                    drop(activate);
+                    let transform: Result<IMFTransform, _> = activate.ActivateObject();
+                    let is_async = transform
+                        .as_ref()
+                        .ok()
+                        .and_then(|transform| {
+                            transform.GetAttributes().ok().and_then(|attributes| {
+                                attributes
+                                    .GetUINT32(&MF_TRANSFORM_ASYNC)
+                                    .ok()
+                                    .map(|value| value != 0)
+                            })
+                        })
+                        .unwrap_or(false);
+                    if transform.is_ok() && (allow_async || !is_async) {
+                        present = true;
+                    }
                 }
             }
         }

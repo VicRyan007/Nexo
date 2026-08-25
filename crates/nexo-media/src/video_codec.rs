@@ -58,6 +58,8 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+use openh264::{decoder::Decoder, formats::YUVSource};
+
 use crate::{
     EncodedVideoFrame, VideoCodec,
     vpx_sys::{
@@ -88,8 +90,150 @@ pub enum VideoCodecError {
     },
     #[error("encoded frame is not VP8")]
     NotVp8,
+    #[error("encoded frame is not H.264")]
+    NotH264,
+    #[error("could not decode MJPEG frame: {detail}")]
+    Mjpeg { detail: String },
     #[error("encoded frame is {actual} bytes, expected exactly {expected} bytes of I420")]
     UnexpectedInputSize { actual: usize, expected: usize },
+}
+
+/// Software H.264 decoder used for frames emitted by a hardware encoder on a
+/// different machine. It is deliberately independent from the local encoder:
+/// receive capability must never depend on whether this machine has a GPU MFT.
+pub struct H264Decoder {
+    decoder: Decoder,
+}
+
+impl H264Decoder {
+    pub fn new() -> Result<Self, VideoCodecError> {
+        let decoder = Decoder::new().map_err(|error| VideoCodecError::Codec {
+            operation: "initialize the H.264 decoder",
+            detail: error.to_string(),
+        })?;
+        Ok(Self { decoder })
+    }
+
+    pub fn decode(
+        &mut self,
+        frame: &EncodedVideoFrame,
+    ) -> Result<Option<DecodedVideoFrame>, VideoCodecError> {
+        if frame.codec != VideoCodec::H264 {
+            return Err(VideoCodecError::NotH264);
+        }
+        let Some(decoded) =
+            self.decoder
+                .decode(&frame.data)
+                .map_err(|error| VideoCodecError::Codec {
+                    operation: "decode the H.264 frame",
+                    detail: error.to_string(),
+                })?
+        else {
+            return Ok(None);
+        };
+        let (width, height) = decoded.dimensions();
+        let (y_stride, uv_stride, _) = decoded.strides();
+        if width == 0 || height == 0 || y_stride < width || uv_stride < width / 2 {
+            return Err(VideoCodecError::Codec {
+                operation: "validate the decoded H.264 planes",
+                detail: format!(
+                    "invalid dimensions or strides {width}x{height} / {y_stride}/{uv_stride}"
+                ),
+            });
+        }
+        let y_len = y_stride
+            .checked_mul(height)
+            .ok_or_else(|| VideoCodecError::Codec {
+                operation: "size the decoded H.264 luma plane",
+                detail: "stride overflow".to_owned(),
+            })?;
+        let uv_len = uv_stride
+            .checked_mul(height / 2)
+            .ok_or_else(|| VideoCodecError::Codec {
+                operation: "size the decoded H.264 chroma planes",
+                detail: "stride overflow".to_owned(),
+            })?;
+        let (y, u, v) = (decoded.y(), decoded.u(), decoded.v());
+        if y.len() < y_len || u.len() < uv_len || v.len() < uv_len {
+            return Err(VideoCodecError::Codec {
+                operation: "validate the decoded H.264 buffers",
+                detail: "decoder returned a short plane".to_owned(),
+            });
+        }
+        Ok(Some(DecodedVideoFrame {
+            width: u32::try_from(width).unwrap_or(u32::MAX),
+            height: u32::try_from(height).unwrap_or(u32::MAX),
+            y_plane: y[..y_len].to_vec().into_boxed_slice(),
+            u_plane: u[..uv_len].to_vec().into_boxed_slice(),
+            v_plane: v[..uv_len].to_vec().into_boxed_slice(),
+            y_stride,
+            uv_stride,
+        }))
+    }
+}
+
+/// Decoder selected by the codec on each received frame.
+pub enum VideoDecoder {
+    Vp8(Vp8Decoder),
+    H264(H264Decoder),
+}
+
+impl VideoDecoder {
+    pub fn new() -> Result<Self, VideoCodecError> {
+        Ok(Self::Vp8(Vp8Decoder::new()?))
+    }
+
+    pub fn decode(
+        &mut self,
+        frame: &EncodedVideoFrame,
+    ) -> Result<Option<DecodedVideoFrame>, VideoCodecError> {
+        match (self, frame.codec) {
+            (Self::Vp8(decoder), VideoCodec::Vp8) => decoder.decode(frame),
+            (Self::H264(decoder), VideoCodec::H264) => decoder.decode(frame),
+            (slot @ Self::Vp8(_), VideoCodec::H264) => {
+                *slot = Self::H264(H264Decoder::new()?);
+                match slot {
+                    Self::H264(decoder) => decoder.decode(frame),
+                    Self::Vp8(_) => unreachable!("decoder slot was just replaced"),
+                }
+            }
+            (slot @ Self::H264(_), VideoCodec::Vp8) => {
+                *slot = Self::Vp8(Vp8Decoder::new()?);
+                match slot {
+                    Self::Vp8(decoder) => decoder.decode(frame),
+                    Self::H264(_) => unreachable!("decoder slot was just replaced"),
+                }
+            }
+        }
+    }
+}
+
+fn validate_dimensions(width: u32, height: u32) -> Result<(usize, usize), VideoCodecError> {
+    if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+        return Err(VideoCodecError::InvalidDimensions { width, height });
+    }
+    let width =
+        usize::try_from(width).map_err(|_| VideoCodecError::InvalidDimensions { width, height })?;
+    let height = usize::try_from(height).map_err(|_| VideoCodecError::InvalidDimensions {
+        width: u32::try_from(width).unwrap_or(u32::MAX),
+        height,
+    })?;
+    Ok((width, height))
+}
+
+fn i420_size(width: usize, height: usize) -> Result<usize, VideoCodecError> {
+    let y_size = width
+        .checked_mul(height)
+        .ok_or(VideoCodecError::InvalidDimensions {
+            width: u32::try_from(width).unwrap_or(u32::MAX),
+            height: u32::try_from(height).unwrap_or(u32::MAX),
+        })?;
+    y_size
+        .checked_add(y_size / 2)
+        .ok_or(VideoCodecError::InvalidDimensions {
+            width: u32::try_from(width).unwrap_or(u32::MAX),
+            height: u32::try_from(height).unwrap_or(u32::MAX),
+        })
 }
 
 fn codec_error(operation: &'static str, ctx: &vpx_codec_ctx_t) -> VideoCodecError {
@@ -314,7 +458,8 @@ impl Vp8Encoder {
     /// `n12_data` must point at `width * height * 3 / 2` bytes in NV12 layout,
     /// and the returned I420 data must be exactly `width * height * 3 / 2` bytes.
     fn nv12_to_i420(n12_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, VideoCodecError> {
-        let y_size = width as usize * height as usize;
+        let (width, height) = validate_dimensions(width, height)?;
+        let y_size = width * height;
         let uv_size = y_size / 4;
         if n12_data.len() < y_size + uv_size {
             return Err(VideoCodecError::UnexpectedInputSize {
@@ -326,7 +471,7 @@ impl Vp8Encoder {
         let mut i420 = vec![0u8; y_size + uv_size * 2];
 
         // Copy Y plane (interleaved at top of NV12)
-        i420[..y_size].copy_from_slice(n12_data);
+        i420[..y_size].copy_from_slice(&n12_data[..y_size]);
 
         // Copy U plane (NV12 has U/V interleaved at half resolution)
         // NV12 UV layout: U0 V0 U1 V1 ... at half both dimensions
@@ -334,29 +479,26 @@ impl Vp8Encoder {
         let u_offset = y_size;
         let v_offset = y_size + uv_size;
         for (i, dst) in i420[u_offset..v_offset]
-            .chunks_exact_mut(width as usize / 2)
+            .chunks_exact_mut(width / 2)
             .enumerate()
         {
-            let src_base = y_size + i * (width as usize / 2);
+            let src_base = y_size + i * width;
             // Take every other byte (U values from interleaved UV)
             for (j, byte) in dst.iter_mut().enumerate() {
                 let src_idx = src_base + j * 2;
-                if src_idx < n12_data.len() {
+                if src_idx < y_size + uv_size * 2 {
                     *byte = n12_data[src_idx];
                 }
             }
         }
 
         // Copy V plane
-        for (i, dst) in i420[v_offset..]
-            .chunks_exact_mut(width as usize / 2)
-            .enumerate()
-        {
-            let src_base = y_size + uv_size + i * (width as usize / 2);
+        for (i, dst) in i420[v_offset..].chunks_exact_mut(width / 2).enumerate() {
+            let src_base = y_size + i * width + 1;
             // Take every other byte starting from 1 (V values from interleaved UV)
             for (j, byte) in dst.iter_mut().enumerate() {
-                let src_idx = src_base + j * 2 + 1;
-                if src_idx < n12_data.len() {
+                let src_idx = src_base + j * 2;
+                if src_idx < y_size + uv_size * 2 {
                     *byte = n12_data[src_idx];
                 }
             }
@@ -375,7 +517,8 @@ impl Vp8Encoder {
     /// `yuy2_data` must point at `width * height * 2` bytes in YUY2 layout,
     /// and the returned I420 data must be exactly `width * height * 3 / 2` bytes.
     fn yuy2_to_i420(yuy2_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, VideoCodecError> {
-        let y_size = width as usize * height as usize;
+        let (width, height) = validate_dimensions(width, height)?;
+        let y_size = width * height;
         let uv_size = y_size / 4;
         if yuy2_data.len() < y_size * 2 {
             return Err(VideoCodecError::UnexpectedInputSize {
@@ -387,10 +530,10 @@ impl Vp8Encoder {
         let mut i420 = vec![0u8; y_size + uv_size * 2];
 
         // Extract Y plane (every other byte from YUY2)
-        for row in 0..height as usize {
-            let yuy2_row_start = row * width as usize * 2;
-            let i420_y_row_start = row * width as usize;
-            for col in 0..width as usize {
+        for row in 0..height {
+            let yuy2_row_start = row * width * 2;
+            let i420_y_row_start = row * width;
+            for col in 0..width {
                 let yuy2_idx = yuy2_row_start + col * 2;
                 let i420_idx = i420_y_row_start + col;
                 if yuy2_idx + 1 < yuy2_data.len() {
@@ -399,29 +542,30 @@ impl Vp8Encoder {
             }
         }
 
-        // Collect U and V values from YUY2 pattern
-        // YUY2 pattern: Y0 U Y1 V Y2 U Y3 V ...
-        // U appears at positions idx % 4 == 1
-        // V appears at positions idx % 4 == 3
-        let mut u_vals = Vec::new();
-        let mut v_vals = Vec::new();
-        for (idx, &byte) in yuy2_data.iter().enumerate() {
-            if idx % 4 == 1 {
-                u_vals.push(byte);
-            } else if idx % 4 == 3 {
-                v_vals.push(byte);
+        // YUY2 carries one U/V pair for every horizontal 2-pixel group on
+        // every row (4:2:2). I420 needs one pair for every 2x2 block (4:2:0),
+        // so average the corresponding chroma samples from two source rows.
+        let u_offset = y_size;
+        let v_offset = y_size + uv_size;
+        let uv_width = width / 2;
+        let uv_height = height / 2;
+        for row in 0..uv_height {
+            for column in 0..uv_width {
+                let top = ((row * 2) * width + column * 2) * 2;
+                let bottom = (((row * 2 + 1) * width) + column * 2) * 2;
+                let u = u32::midpoint(
+                    u32::from(yuy2_data[top + 1]),
+                    u32::from(yuy2_data[bottom + 1]),
+                );
+                let v = u32::midpoint(
+                    u32::from(yuy2_data[top + 3]),
+                    u32::from(yuy2_data[bottom + 3]),
+                );
+                let index = row * uv_width + column;
+                i420[u_offset + index] = u8::try_from(u).unwrap_or(u8::MAX);
+                i420[v_offset + index] = u8::try_from(v).unwrap_or(u8::MAX);
             }
         }
-
-        // U and V are at half resolution (width/2 * height/2 each)
-        let uv_plane_size = uv_size;
-        // Fill U plane (first half of chroma)
-        let u_plane_len = std::cmp::min(u_vals.len(), uv_plane_size);
-        i420[y_size..y_size + u_plane_len].copy_from_slice(&u_vals[..u_plane_len]);
-        // Fill V plane (second half of chroma)
-        let v_plane_len = std::cmp::min(v_vals.len(), uv_plane_size);
-        i420[y_size + u_plane_len..y_size + u_plane_len + v_plane_len]
-            .copy_from_slice(&v_vals[..v_plane_len]);
 
         Ok(i420)
     }
@@ -436,7 +580,8 @@ impl Vp8Encoder {
     /// `bgra_data` must point at `width * height * 4` bytes in BGRA layout,
     /// and the returned I420 data must be exactly `width * height * 3 / 2` bytes.
     fn bgra_to_i420(bgra_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, VideoCodecError> {
-        let y_size = width as usize * height as usize;
+        let (width, height) = validate_dimensions(width, height)?;
+        let y_size = width * height;
         let uv_size = y_size / 4;
         if bgra_data.len() < y_size * 4 {
             return Err(VideoCodecError::UnexpectedInputSize {
@@ -447,27 +592,43 @@ impl Vp8Encoder {
 
         let mut i420 = vec![0u8; y_size + uv_size * 2];
 
-        // Copy Y plane from luma (use green channel as approximation)
-        for (i, byte) in i420[..y_size].iter_mut().enumerate() {
-            // Use green channel as luma approximation
-            let bgra_idx = i * 4 + 1; // G is at offset 1 in BGRA
-            if bgra_idx < bgra_data.len() {
-                *byte = bgra_data[bgra_idx];
+        // Convert every pixel's RGB components to the full-resolution Y plane.
+        // Screen capture is commonly colorful, so using only the green channel
+        // here would silently turn the shared desktop into grayscale video.
+        for row in 0..height {
+            for column in 0..width {
+                let pixel = (row * width + column) * 4;
+                let blue = bgra_data[pixel];
+                let green = bgra_data[pixel + 1];
+                let red = bgra_data[pixel + 2];
+                i420[row * width + column] = rgb_to_y(red, green, blue);
             }
         }
 
-        // U plane (half width, half height) - use mid-value as placeholder
-        let u_v_stride = width as usize / 2;
-        for dst in i420[y_size..y_size + uv_size].chunks_exact_mut(u_v_stride) {
-            for byte in dst.iter_mut() {
-                *byte = 128; // neutral U value
-            }
-        }
-
-        // V plane
-        for dst in i420[y_size + uv_size..].chunks_exact_mut(u_v_stride) {
-            for byte in dst.iter_mut() {
-                *byte = 128; // neutral V value
+        // Average each 2x2 RGB block into the subsampled U/V planes. This is
+        // the same 4:2:0 layout expected by the VP8 and H.264 encoders.
+        let u_offset = y_size;
+        let v_offset = y_size + uv_size;
+        let uv_width = width / 2;
+        let uv_height = height / 2;
+        for row in 0..uv_height {
+            for column in 0..uv_width {
+                let mut u_sum = 0u32;
+                let mut v_sum = 0u32;
+                for source_row in 0..2 {
+                    for source_column in 0..2 {
+                        let pixel =
+                            ((row * 2 + source_row) * width + column * 2 + source_column) * 4;
+                        let blue = bgra_data[pixel];
+                        let green = bgra_data[pixel + 1];
+                        let red = bgra_data[pixel + 2];
+                        u_sum += u32::from(rgb_to_u(red, green, blue));
+                        v_sum += u32::from(rgb_to_v(red, green, blue));
+                    }
+                }
+                let index = row * uv_width + column;
+                i420[u_offset + index] = u8::try_from(u_sum / 4).unwrap_or(u8::MAX);
+                i420[v_offset + index] = u8::try_from(v_sum / 4).unwrap_or(u8::MAX);
             }
         }
 
@@ -486,11 +647,7 @@ impl Vp8Encoder {
                 Self::yuy2_to_i420(&frame.data, frame.width, frame.height)
             }
             nexo_video::PixelFormat::Mjpg => {
-                // MJPEG is compressed; needs decompression before encoding
-                Err(VideoCodecError::UnexpectedInputSize {
-                    actual: 0,
-                    expected: 0,
-                })
+                Self::mjpg_to_i420(&frame.data, frame.width, frame.height)
             }
             nexo_video::PixelFormat::Bgra8 => {
                 Self::bgra_to_i420(&frame.data, frame.width, frame.height)
@@ -501,6 +658,142 @@ impl Vp8Encoder {
             }),
         }
     }
+
+    fn mjpg_to_i420(mjpg_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, VideoCodecError> {
+        let (width, height) = validate_dimensions(width, height)?;
+        let decoded = image::load_from_memory_with_format(mjpg_data, image::ImageFormat::Jpeg)
+            .map_err(|error| VideoCodecError::Mjpeg {
+                detail: error.to_string(),
+            })?
+            .to_rgb8();
+        if decoded.width() != u32::try_from(width).unwrap_or(u32::MAX)
+            || decoded.height() != u32::try_from(height).unwrap_or(u32::MAX)
+        {
+            return Err(VideoCodecError::Mjpeg {
+                detail: format!(
+                    "quadro JPEG tem {}x{}, mas a camera informou {}x{}",
+                    decoded.width(),
+                    decoded.height(),
+                    width,
+                    height
+                ),
+            });
+        }
+
+        let y_size = width * height;
+        let uv_width = width / 2;
+        let uv_height = height / 2;
+        let uv_size = uv_width * uv_height;
+        let mut output = vec![0u8; y_size + uv_size * 2];
+        for y in 0..height {
+            for x in 0..width {
+                let pixel = decoded.get_pixel(x as u32, y as u32).0;
+                output[y * width + x] = rgb_to_y(pixel[0], pixel[1], pixel[2]);
+            }
+        }
+        let u_offset = y_size;
+        let v_offset = y_size + uv_size;
+        for y in 0..uv_height {
+            for x in 0..uv_width {
+                let mut u_sum = 0u32;
+                let mut v_sum = 0u32;
+                for row in 0..2 {
+                    for column in 0..2 {
+                        let pixel = decoded
+                            .get_pixel((x * 2 + column) as u32, (y * 2 + row) as u32)
+                            .0;
+                        u_sum += rgb_to_u(pixel[0], pixel[1], pixel[2]) as u32;
+                        v_sum += rgb_to_v(pixel[0], pixel[1], pixel[2]) as u32;
+                    }
+                }
+                let index = y * uv_width + x;
+                output[u_offset + index] = u8::try_from(u_sum / 4).unwrap_or(u8::MAX);
+                output[v_offset + index] = u8::try_from(v_sum / 4).unwrap_or(u8::MAX);
+            }
+        }
+        Ok(output)
+    }
+}
+
+fn clamp_to_u8(value: i32) -> u8 {
+    u8::try_from(value.clamp(0, 255)).unwrap_or_default()
+}
+
+fn rgb_to_y(red: u8, green: u8, blue: u8) -> u8 {
+    clamp_to_u8(
+        (66 * i32::from(red) + 129 * i32::from(green) + 25 * i32::from(blue) + 128) / 256 + 16,
+    )
+}
+
+fn rgb_to_u(red: u8, green: u8, blue: u8) -> u8 {
+    clamp_to_u8(
+        (-38 * i32::from(red) - 74 * i32::from(green) + 112 * i32::from(blue) + 128) / 256 + 128,
+    )
+}
+
+fn rgb_to_v(red: u8, green: u8, blue: u8) -> u8 {
+    clamp_to_u8(
+        (112 * i32::from(red) - 94 * i32::from(green) - 18 * i32::from(blue) + 128) / 256 + 128,
+    )
+}
+
+/// Resize a tightly packed I420 frame with bounded nearest-neighbour sampling.
+/// The video engine uses this to keep camera and monitor captures within the
+/// fixed software VP8 profile while accepting any even source resolution.
+pub fn resize_i420_nearest(
+    input: &[u8],
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+) -> Result<Vec<u8>, VideoCodecError> {
+    let (source_width, source_height) = validate_dimensions(source_width, source_height)?;
+    let (target_width, target_height) = validate_dimensions(target_width, target_height)?;
+    let source_size = i420_size(source_width, source_height)?;
+    if input.len() != source_size {
+        return Err(VideoCodecError::UnexpectedInputSize {
+            actual: input.len(),
+            expected: source_size,
+        });
+    }
+    let target_size = i420_size(target_width, target_height)?;
+    if source_width == target_width && source_height == target_height {
+        return Ok(input.to_vec());
+    }
+
+    let source_y_size = source_width * source_height;
+    let source_uv_size = source_y_size / 4;
+    let target_y_size = target_width * target_height;
+    let target_uv_width = target_width / 2;
+    let target_uv_height = target_height / 2;
+    let source_uv_width = source_width / 2;
+    let source_uv_height = source_height / 2;
+    let source_y = &input[..source_y_size];
+    let source_u = &input[source_y_size..source_y_size + source_uv_size];
+    let source_v = &input[source_y_size + source_uv_size..];
+    let mut output = vec![0u8; target_size];
+    let target_y = &mut output[..target_y_size];
+    for target_y_index in 0..target_height {
+        let source_row = target_y_index * source_height / target_height;
+        for target_x_index in 0..target_width {
+            let source_column = target_x_index * source_width / target_width;
+            target_y[target_y_index * target_width + target_x_index] =
+                source_y[source_row * source_width + source_column];
+        }
+    }
+    let (target_u, target_v) =
+        output[target_y_size..].split_at_mut(target_uv_width * target_uv_height);
+    for target_y_index in 0..target_uv_height {
+        let source_row = target_y_index * source_uv_height / target_uv_height;
+        for target_x_index in 0..target_uv_width {
+            let source_column = target_x_index * source_uv_width / target_uv_width;
+            target_u[target_y_index * target_uv_width + target_x_index] =
+                source_u[source_row * source_uv_width + source_column];
+            target_v[target_y_index * target_uv_width + target_x_index] =
+                source_v[source_row * source_uv_width + source_column];
+        }
+    }
+    Ok(output)
 }
 
 pub fn frame_to_i420(frame: &nexo_video::VideoFrame) -> Result<Vec<u8>, VideoCodecError> {
@@ -515,6 +808,44 @@ impl Drop for Vp8Encoder {
             vpx_codec_destroy(&mut self.ctx);
         }
     }
+}
+
+/// Convert tightly packed I420 into tightly packed NV12.
+///
+/// This is the upload format accepted by the Windows hardware H.264 MFT.
+/// The conversion is deliberately explicit and bounded so a native encoder
+/// never receives a buffer whose layout was inferred from untrusted input.
+pub fn i420_to_nv12(i420: &[u8], width: u32, height: u32) -> Result<Vec<u8>, VideoCodecError> {
+    let (width, height) = validate_dimensions(width, height)?;
+    let y_size = width
+        .checked_mul(height)
+        .ok_or(VideoCodecError::InvalidDimensions {
+            width: u32::try_from(width).unwrap_or(u32::MAX),
+            height: u32::try_from(height).unwrap_or(u32::MAX),
+        })?;
+    let chroma_size = y_size / 4;
+    let expected =
+        y_size
+            .checked_add(chroma_size * 2)
+            .ok_or(VideoCodecError::InvalidDimensions {
+                width: u32::try_from(width).unwrap_or(u32::MAX),
+                height: u32::try_from(height).unwrap_or(u32::MAX),
+            })?;
+    if i420.len() != expected {
+        return Err(VideoCodecError::UnexpectedInputSize {
+            actual: i420.len(),
+            expected,
+        });
+    }
+    let mut nv12 = vec![0u8; expected];
+    nv12[..y_size].copy_from_slice(&i420[..y_size]);
+    let u = &i420[y_size..y_size + chroma_size];
+    let v = &i420[y_size + chroma_size..];
+    for (index, pair) in nv12[y_size..].chunks_exact_mut(2).enumerate() {
+        pair[0] = u[index];
+        pair[1] = v[index];
+    }
+    Ok(nv12)
 }
 
 /// Decoded I420 frame ready for rendering.
@@ -538,7 +869,13 @@ impl DecodedVideoFrame {
     pub fn to_rgba(&self) -> Vec<u8> {
         let width = self.width as usize;
         let height = self.height as usize;
-        let mut rgba = vec![0u8; width * height * 4];
+        let Some(pixel_count) = width.checked_mul(height) else {
+            return Vec::new();
+        };
+        let Some(byte_count) = pixel_count.checked_mul(4) else {
+            return Vec::new();
+        };
+        let mut rgba = vec![0u8; byte_count];
 
         for y in 0..height {
             let y_row = y * self.y_stride;
@@ -546,9 +883,9 @@ impl DecodedVideoFrame {
             let out_row = y * width * 4;
 
             for x in 0..width {
-                let y_val = i32::from(self.y_plane[y_row + x]);
-                let u_val = i32::from(self.u_plane[uv_row + (x / 2)]);
-                let v_val = i32::from(self.v_plane[uv_row + (x / 2)]);
+                let y_val = i32::from(*self.y_plane.get(y_row + x).unwrap_or(&0));
+                let u_val = i32::from(*self.u_plane.get(uv_row + (x / 2)).unwrap_or(&128));
+                let v_val = i32::from(*self.v_plane.get(uv_row + (x / 2)).unwrap_or(&128));
 
                 let c = y_val - 16;
                 let d = u_val - 128;
@@ -572,11 +909,12 @@ impl DecodedVideoFrame {
 /// Convert tightly packed I420 bytes to 32-bit RGBA pixels (`[R, G, B, A]`).
 #[allow(clippy::many_single_char_names)]
 pub fn i420_to_rgba(i420: &[u8], width: u32, height: u32) -> Result<Vec<u8>, VideoCodecError> {
-    let w = width as usize;
-    let h = height as usize;
-    let y_size = w * h;
+    let (w, h) = validate_dimensions(width, height)?;
+    let y_size = w
+        .checked_mul(h)
+        .ok_or(VideoCodecError::InvalidDimensions { width, height })?;
     let uv_size = y_size / 4;
-    let total = y_size + uv_size * 2;
+    let total = i420_size(w, h)?;
     if i420.len() != total {
         return Err(VideoCodecError::UnexpectedInputSize {
             actual: i420.len(),
@@ -587,7 +925,10 @@ pub fn i420_to_rgba(i420: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Vid
     let u_plane = &i420[y_size..y_size + uv_size];
     let v_plane = &i420[y_size + uv_size..];
 
-    let mut rgba = vec![0u8; w * h * 4];
+    let byte_count = y_size
+        .checked_mul(4)
+        .ok_or(VideoCodecError::InvalidDimensions { width, height })?;
+    let mut rgba = vec![0u8; byte_count];
     for y in 0..h {
         let y_row = y * w;
         let uv_row = (y / 2) * (w / 2);
@@ -684,9 +1025,22 @@ impl Vp8Decoder {
         let image = unsafe { &*image };
         let width = image.d_w;
         let height = image.d_h;
+        let (width_usize, height_usize) = validate_dimensions(width, height)?;
         let y_stride = usize::try_from(image.stride[0]).unwrap_or(0);
         let uv_stride = usize::try_from(image.stride[1]).unwrap_or(0);
-        let height = usize::try_from(height).unwrap_or(0);
+        if y_stride < width_usize || uv_stride < width_usize / 2 {
+            return Err(VideoCodecError::Codec {
+                operation: "validate the decoded VP8 planes",
+                detail: format!("invalid strides {y_stride}/{uv_stride} for {width}x{height}"),
+            });
+        }
+        if image.planes[0].is_null() || image.planes[1].is_null() || image.planes[2].is_null() {
+            return Err(VideoCodecError::Codec {
+                operation: "validate the decoded VP8 planes",
+                detail: "libvpx returned a null plane".to_owned(),
+            });
+        }
+        let height = height_usize;
         let y_len = y_stride
             .checked_mul(height)
             .ok_or_else(|| VideoCodecError::Codec {
@@ -848,5 +1202,136 @@ mod tests {
         let rgba = i420_to_rgba(&input, 640, 480).expect("conversion should succeed");
         assert_eq!(rgba.len(), 640 * 480 * 4);
         assert_eq!(rgba[3], 255); // Alpha should be 255
+    }
+
+    #[test]
+    fn bgra_conversion_preserves_chroma_for_screen_capture() {
+        let frame = nexo_video::VideoFrame {
+            width: 2,
+            height: 2,
+            format: nexo_video::PixelFormat::Bgra8,
+            timestamp: Duration::ZERO,
+            data: [0, 0, 255, 255].repeat(4).into_boxed_slice(),
+        };
+        let i420 = Vp8Encoder::frame_to_i420(&frame).expect("BGRA should convert");
+
+        assert_eq!(&i420[..4], &[rgb_to_y(255, 0, 0); 4]);
+        assert_eq!(i420[4], rgb_to_u(255, 0, 0));
+        assert_eq!(i420[5], rgb_to_v(255, 0, 0));
+        assert_ne!(i420[4], 128, "red screen content must not become grayscale");
+        assert_ne!(i420[5], 128, "red screen content must not become grayscale");
+    }
+
+    #[test]
+    fn nv12_conversion_copies_only_the_luma_plane_and_separates_chroma() {
+        let width = 4_u32;
+        let height = 2_u32;
+        let y_size = usize::try_from(width * height).expect("test dimensions fit");
+        let mut nv12 = vec![0u8; y_size + y_size / 2];
+        nv12[..y_size].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        nv12[y_size..].copy_from_slice(&[10, 20, 30, 40]);
+        let i420 =
+            Vp8Encoder::nv12_to_i420(&nv12, width, height).expect("valid NV12 should convert");
+        assert_eq!(&i420[..y_size], &nv12[..y_size]);
+        assert_eq!(&i420[y_size..y_size + 2], &[10, 30]);
+        assert_eq!(&i420[y_size + 2..], &[20, 40]);
+    }
+
+    #[test]
+    fn yuy2_conversion_vertically_subsamples_chroma_into_i420() {
+        let width = 4_u32;
+        let height = 4_u32;
+        let mut yuy2 = Vec::new();
+        for row in 0..height {
+            let u = 10 + row * 20;
+            let v = 20 + row * 20;
+            for group in 0..(width / 2) {
+                yuy2.extend_from_slice(&[
+                    16 + u8::try_from(row + group).unwrap_or_default(),
+                    u8::try_from(u).unwrap_or_default(),
+                    16,
+                    u8::try_from(v).unwrap_or_default(),
+                ]);
+            }
+        }
+
+        let i420 =
+            Vp8Encoder::yuy2_to_i420(&yuy2, width, height).expect("valid YUY2 should convert");
+        let y_size = usize::try_from(width * height).expect("test dimensions fit");
+        let uv_size = y_size / 4;
+        assert_eq!(&i420[y_size..y_size + uv_size], &[20, 20, 60, 60]);
+        assert_eq!(&i420[y_size + uv_size..], &[30, 30, 70, 70]);
+    }
+
+    #[test]
+    fn i420_to_nv12_interleaves_chroma_without_changing_luma() {
+        let i420 = [1_u8, 2, 3, 4, 5, 6, 7, 8, 10, 20, 30, 40];
+        let nv12 = i420_to_nv12(&i420, 4, 2).expect("valid I420 should convert");
+        assert_eq!(nv12, vec![1, 2, 3, 4, 5, 6, 7, 8, 10, 30, 20, 40]);
+    }
+
+    #[test]
+    fn invalid_capture_dimensions_are_rejected_without_panicking() {
+        let result = Vp8Encoder::frame_to_i420(&nexo_video::VideoFrame {
+            width: 0,
+            height: 0,
+            format: nexo_video::PixelFormat::Nv12,
+            timestamp: Duration::ZERO,
+            data: vec![0; 16].into_boxed_slice(),
+        });
+        assert!(matches!(
+            result,
+            Err(VideoCodecError::InvalidDimensions { .. })
+        ));
+    }
+
+    #[test]
+    fn rgba_conversion_rejects_invalid_dimensions_without_panicking() {
+        assert!(matches!(
+            i420_to_rgba(&[], 0, 480),
+            Err(VideoCodecError::InvalidDimensions { .. })
+        ));
+        assert!(matches!(
+            i420_to_rgba(&[], 641, 480),
+            Err(VideoCodecError::InvalidDimensions { .. })
+        ));
+    }
+
+    #[test]
+    fn malformed_decoded_planes_render_as_black_instead_of_panicking() {
+        let frame = DecodedVideoFrame {
+            width: 4,
+            height: 2,
+            y_plane: vec![16].into_boxed_slice(),
+            u_plane: vec![128].into_boxed_slice(),
+            v_plane: vec![128].into_boxed_slice(),
+            y_stride: 1,
+            uv_stride: 1,
+        };
+        let rgba = frame.to_rgba();
+        assert_eq!(rgba.len(), 4 * 2 * 4);
+        assert_eq!(&rgba[..4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn i420_resize_accepts_a_different_even_capture_resolution() {
+        let source = vec![128u8; 4 * 2 * 3 / 2];
+        let resized =
+            resize_i420_nearest(&source, 4, 2, 2, 2).expect("even I420 frames should resize");
+        assert_eq!(resized.len(), 2 * 2 * 3 / 2);
+    }
+
+    #[test]
+    fn mjpeg_frames_are_decoded_to_i420() {
+        let rgb = [
+            255, 0, 0, 0, 255, 0, // red, green
+            0, 0, 255, 255, 255, 255, // blue, white
+        ];
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode(&rgb, 2, 2, image::ExtendedColorType::Rgb8)
+            .expect("test JPEG should encode");
+        let i420 = Vp8Encoder::mjpg_to_i420(&jpeg, 2, 2).expect("test JPEG should decode");
+        assert_eq!(i420.len(), 2 * 2 * 3 / 2);
     }
 }

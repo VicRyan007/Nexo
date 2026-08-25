@@ -22,11 +22,15 @@ pipewire = "0.10"
 # remaining tokio features (net/time/io-util/sync) transitively.
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 x11rb = { version = "0.13", features = ["randr"] }
+# H.264 encode through libva when a compatible DRM render node and driver are
+# present. The crate resolves libva at runtime, so hosts without it retain the
+# VP8 software fallback.
+moq-vaapi = "0.0.3"
 
 [target.'cfg(windows)'.dependencies]
 # Native video capture and probing through the official `windows` crate:
-# Media Foundation (camera enumeration, MFT encoder detection), DXGI (GPU
-# description) and AMF (AMD runtime detection). All `unsafe` from these calls is
+# Media Foundation (camera enumeration and MFT encoder detection) and DXGI (GPU
+# description). All `unsafe` from these calls is
 # isolated in src/platform/windows.rs behind safe functions.
 windows = { version = "0.62", features = [
 
@@ -48,9 +52,11 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
-    "Win32_System_LibraryLoader",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
     "Win32_System_Memory",
 ] }
+windows-core = "0.62"
 
 [lints.rust]
 # Workspace forbids `unsafe`; this crate is the documented exception and keeps

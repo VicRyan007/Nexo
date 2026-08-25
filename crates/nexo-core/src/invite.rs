@@ -26,6 +26,8 @@ pub struct NetworkInvite {
     pub created_at: u64,
     pub expires_at: u64,
     pub nonce: String,
+    #[serde(default)]
+    pub group_secret: Option<String>,
     pub signature: String,
 }
 
@@ -53,6 +55,19 @@ struct SignedFields<'a> {
     created_at: u64,
     expires_at: u64,
     nonce: &'a str,
+    group_secret: &'a Option<String>,
+}
+
+#[derive(Serialize)]
+struct LegacySignedFields<'a> {
+    version: u8,
+    network_id: Uuid,
+    network_name: &'a str,
+    inviter_key: &'a str,
+    addresses: &'a [String],
+    created_at: u64,
+    expires_at: u64,
+    nonce: &'a str,
 }
 
 impl NetworkInvite {
@@ -71,6 +86,8 @@ impl NetworkInvite {
 
         let mut nonce = [0_u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let mut group_secret = [0_u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut group_secret);
         let mut invite = Self {
             version: VERSION,
             network_id: Uuid::new_v4(),
@@ -82,6 +99,7 @@ impl NetworkInvite {
                 .checked_add(lifetime_seconds)
                 .ok_or(InviteError::Lifetime)?,
             nonce: URL_SAFE_NO_PAD.encode(nonce),
+            group_secret: Some(URL_SAFE_NO_PAD.encode(group_secret)),
             signature: String::new(),
         };
         invite.signature = URL_SAFE_NO_PAD.encode(identity.sign(&invite.signing_bytes()?));
@@ -117,6 +135,14 @@ impl NetworkInvite {
         if now > self.expires_at {
             return Err(InviteError::Expired);
         }
+        if let Some(secret) = &self.group_secret {
+            let secret = URL_SAFE_NO_PAD
+                .decode(secret)
+                .map_err(|_| InviteError::InvalidData)?;
+            if secret.len() != 32 {
+                return Err(InviteError::InvalidData);
+            }
+        }
 
         let public_key: [u8; 32] = URL_SAFE_NO_PAD
             .decode(&self.inviter_key)
@@ -128,7 +154,11 @@ impl NetworkInvite {
             .map_err(|_| InviteError::InvalidSignature)?
             .try_into()
             .map_err(|_| InviteError::InvalidSignature)?;
-        DeviceIdentity::verify(&public_key, &self.signing_bytes()?, &signature)
+        let signed = DeviceIdentity::verify(&public_key, &self.signing_bytes()?, &signature);
+        if signed.is_ok() || self.group_secret.is_some() {
+            return signed.map_err(map_identity_error);
+        }
+        DeviceIdentity::verify(&public_key, &self.legacy_signing_bytes()?, &signature)
             .map_err(map_identity_error)
     }
 
@@ -137,8 +167,31 @@ impl NetworkInvite {
         Ok(format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(json)))
     }
 
+    #[must_use]
+    pub fn group_secret_bytes(&self) -> Option<[u8; 32]> {
+        self.group_secret
+            .as_deref()
+            .and_then(|secret| URL_SAFE_NO_PAD.decode(secret).ok())
+            .and_then(|secret| secret.try_into().ok())
+    }
+
     fn signing_bytes(&self) -> Result<Vec<u8>, InviteError> {
         serde_json::to_vec(&SignedFields {
+            version: self.version,
+            network_id: self.network_id,
+            network_name: &self.network_name,
+            inviter_key: &self.inviter_key,
+            addresses: &self.addresses,
+            created_at: self.created_at,
+            expires_at: self.expires_at,
+            nonce: &self.nonce,
+            group_secret: &self.group_secret,
+        })
+        .map_err(|_| InviteError::InvalidData)
+    }
+
+    fn legacy_signing_bytes(&self) -> Result<Vec<u8>, InviteError> {
+        serde_json::to_vec(&LegacySignedFields {
             version: self.version,
             network_id: self.network_id,
             network_name: &self.network_name,
@@ -195,6 +248,8 @@ mod tests {
         let decoded = NetworkInvite::decode_and_verify(&code, 1_100)
             .expect("invite should decode and verify");
         assert_eq!(decoded.network_id, invite.network_id);
+        assert_eq!(decoded.group_secret_bytes(), invite.group_secret_bytes());
+        assert!(decoded.group_secret_bytes().is_some());
 
         let mut tampered = decoded;
         tampered.network_name = "Outra rede".into();
@@ -207,5 +262,21 @@ mod tests {
             NetworkInvite::create(&DeviceIdentity::generate(), "LAN", Vec::new(), 1_000, 60)
                 .expect("invite should be created");
         assert!(matches!(invite.verify(1_061), Err(InviteError::Expired)));
+    }
+
+    #[test]
+    fn legacy_invite_without_group_secret_remains_verifiable() {
+        let identity = DeviceIdentity::generate();
+        let mut invite = NetworkInvite::create(&identity, "LAN", Vec::new(), 1_000, 60)
+            .expect("invite should be created");
+        invite.group_secret = None;
+        invite.signature = URL_SAFE_NO_PAD.encode(
+            identity.sign(
+                &invite
+                    .legacy_signing_bytes()
+                    .expect("legacy fields should serialize"),
+            ),
+        );
+        invite.verify(1_001).expect("legacy invite should verify");
     }
 }

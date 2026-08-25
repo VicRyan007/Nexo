@@ -68,7 +68,37 @@ impl FileTransferOffer {
         root_sha256: [u8; 32],
         created_at: u64,
     ) -> Result<Self, FileTransferError> {
-        let chunk_size = DEFAULT_CHUNK_SIZE;
+        Self::create_with_chunk_size(
+            identity,
+            community_id,
+            channel_id,
+            file_name,
+            file_size,
+            mime_type,
+            root_sha256,
+            created_at,
+            DEFAULT_CHUNK_SIZE,
+        )
+    }
+
+    /// Create a signed offer with an explicit chunk size. WebRTC data
+    /// channels use a smaller value than the libp2p transfer stream because
+    /// SCTP messages have a bounded maximum size.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_chunk_size(
+        identity: &DeviceIdentity,
+        community_id: Uuid,
+        channel_id: Uuid,
+        file_name: String,
+        file_size: u64,
+        mime_type: String,
+        root_sha256: [u8; 32],
+        created_at: u64,
+        chunk_size: u32,
+    ) -> Result<Self, FileTransferError> {
+        if chunk_size == 0 {
+            return Err(FileTransferError::InvalidSize(file_size));
+        }
         let total_chunks = if file_size == 0 {
             1
         } else {

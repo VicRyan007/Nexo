@@ -24,10 +24,17 @@ fn opens_camera_and_reads_a_frame() {
         "resolucao invalida {width}x{height}"
     );
 
-    let frame = source
-        .read_frame()
-        .expect("ler frame")
-        .expect("frame presente");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let frame = loop {
+        if let Some(frame) = source.read_frame().expect("ler frame") {
+            break frame;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "camera nao entregou um frame no prazo"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     assert!(!frame.data.is_empty(), "frame vazio");
     assert_eq!(frame.width, width);
     assert_eq!(frame.height, height);

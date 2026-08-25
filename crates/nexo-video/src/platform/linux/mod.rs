@@ -27,6 +27,101 @@ mod screen;
 
 pub(crate) use screen::{ScreenCapture, enumerate_monitors};
 
+/// H.264 encoder backed by the system's VA-API driver.
+pub(crate) struct HardwareH264Encoder {
+    inner: moq_vaapi::encode::Encoder,
+    width: u32,
+    height: u32,
+    frame_index: u64,
+}
+
+pub(crate) struct NativeEncodedH264Frame {
+    pub(crate) timestamp: std::time::Duration,
+    pub(crate) data: Box<[u8]>,
+    pub(crate) is_keyframe: bool,
+}
+
+impl HardwareH264Encoder {
+    pub(crate) fn new(width: u32, height: u32, bitrate_bps: u32) -> Result<Self, VideoError> {
+        let devices = render_nodes();
+        if devices.is_empty() {
+            return Err(VideoError::encoder(
+                "nenhum render node DRM encontrado em /dev/dri",
+            ));
+        }
+
+        let mut errors = Vec::new();
+        for device in devices {
+            let mut config =
+                moq_vaapi::encode::Config::new(width, height, 30, bitrate_bps.max(100_000), 60);
+            config.device.clone_from(&device);
+            match moq_vaapi::encode::Encoder::new(config) {
+                Ok(inner) => {
+                    return Ok(Self {
+                        inner,
+                        width,
+                        height,
+                        frame_index: 0,
+                    });
+                }
+                Err(error) => errors.push(format!("{}: {error}", device.display())),
+            }
+        }
+
+        Err(VideoError::encoder(format!(
+            "nenhum driver VA-API aceitou H.264 ({})",
+            errors.join("; ")
+        )))
+    }
+
+    pub(crate) fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub(crate) fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub(crate) fn encode(
+        &mut self,
+        timestamp: std::time::Duration,
+        nv12: &[u8],
+    ) -> Result<Option<NativeEncodedH264Frame>, VideoError> {
+        let keyframe = self.frame_index.is_multiple_of(60);
+        let data = self
+            .inner
+            .encode_nv12(nv12, keyframe)
+            .map_err(|error| VideoError::encoder(error.to_string()))?;
+        self.frame_index = self.frame_index.wrapping_add(1);
+        Ok(Some(NativeEncodedH264Frame {
+            timestamp,
+            data: data.into_boxed_slice(),
+            is_keyframe: keyframe,
+        }))
+    }
+}
+
+/// Return explicit user selection first, then stable DRM render nodes.
+fn render_nodes() -> Vec<std::path::PathBuf> {
+    if let Ok(device) = std::env::var("NEXO_VAAPI_DEVICE") {
+        let path = std::path::PathBuf::from(device);
+        return path.exists().then_some(path).into_iter().collect();
+    }
+
+    let mut devices = std::fs::read_dir("/dev/dri")
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("renderD"))
+        })
+        .collect::<Vec<_>>();
+    devices.sort();
+    devices
+}
+
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -617,39 +712,20 @@ pub(super) fn gpu() -> Option<String> {
     None
 }
 
-/// Hardware encoders reported when a VA-API runtime is present. This is a
-/// presence check (render node or libva), not a per-codec capability query.
+/// Report only an encoder that successfully initializes against the local
+/// driver. Presence of libva or `/dev/dri` alone is not enough.
 pub(super) fn hardware_video_encoders() -> Vec<CodecCapability> {
-    if !va_api_present() {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*AVAILABLE.get_or_init(|| HardwareH264Encoder::new(640, 480, 1_500_000).is_ok()) {
         return Vec::new();
     }
-    vec![
-        CodecCapability {
-            name: "H264".into(),
-            kind: MediaKind::Video,
-            encode: true,
-            decode: true,
-            acceleration: AccelerationApi::VaApi,
-        },
-        CodecCapability {
-            name: "HEVC".into(),
-            kind: MediaKind::Video,
-            encode: true,
-            decode: true,
-            acceleration: AccelerationApi::VaApi,
-        },
-    ]
-}
-
-/// Whether a VA-API runtime is likely available (render node or libva on disk).
-fn va_api_present() -> bool {
-    const VA_LIBS: [&str; 4] = [
-        "/usr/lib/x86_64-linux-gnu/libva.so.2",
-        "/usr/lib/libva.so.2",
-        "/usr/lib64/libva.so.2",
-        "/lib/x86_64-linux-gnu/libva.so.2",
-    ];
-    VA_LIBS.iter().any(|lib| Path::new(lib).exists()) || std::fs::read_dir("/dev/dri").is_ok()
+    vec![CodecCapability {
+        name: "H264".into(),
+        kind: MediaKind::Video,
+        encode: true,
+        decode: true,
+        acceleration: AccelerationApi::VaApi,
+    }]
 }
 
 pub(super) fn capture_backends() -> Vec<CaptureBackend> {

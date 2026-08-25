@@ -24,7 +24,7 @@
 
 - Camera and screen capture through platform backends.
 - GPU rendering through Slint's native renderer.
-- D3D12/AMF acceleration on Windows and Vulkan/VA-API acceleration on Linux.
+- D3D12/Media Foundation acceleration on Windows and VA-API H.264 acceleration on Linux.
 - Runtime capability probing with software fallback.
 - Simulcast and adaptive bitrate.
 
@@ -37,7 +37,9 @@
 
 ## M5 - Internet and hardening
 
-- DHT/rendezvous discovery, hole punching and optional relay.
+- Optional Kademlia bootstrap discovery, Circuit Relay v2 client reservations, DCUtR and an
+  opt-in bounded relay-server mode are implemented; rendezvous and cross-network hole-punch
+  validation remain.
 - End-to-end media encryption above the SFU.
-- Device revocation, moderation and signed updates.
+- Device revocation and founder moderation are implemented; signed updates remain.
 - Reproducible Windows and Linux packages.

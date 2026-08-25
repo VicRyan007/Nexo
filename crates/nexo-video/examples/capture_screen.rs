@@ -47,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     frame.data.len()
                 );
             }
-            None => break,
+            None => std::thread::sleep(std::time::Duration::from_millis(10)),
         }
     }
     println!("Frames capturados: {frames}");

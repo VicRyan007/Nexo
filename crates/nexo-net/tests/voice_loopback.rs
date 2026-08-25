@@ -261,8 +261,8 @@ async fn connect_nodes(
             let _ = initiator
                 .dial(responder_peer, responder_address.clone())
                 .await;
-            let initiator_ok = peer_connected(initiator).await;
-            let responder_ok = peer_connected(responder).await;
+            let initiator_ok = peer_connected(initiator, responder_peer).await;
+            let responder_ok = peer_connected(responder, initiator.local_peer_id()).await;
             if initiator_ok && responder_ok {
                 return;
             }
@@ -272,12 +272,12 @@ async fn connect_nodes(
     .expect("nodes should connect");
 }
 
-async fn peer_connected(service: &mut DiscoveryService) -> bool {
+async fn peer_connected(service: &mut DiscoveryService, expected_peer: libp2p::PeerId) -> bool {
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             if matches!(
                 service.next_event().await,
-                Some(DiscoveryEvent::PeerConnected(_))
+                Some(DiscoveryEvent::PeerConnected(peer_id)) if peer_id == expected_peer
             ) {
                 return;
             }

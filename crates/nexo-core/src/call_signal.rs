@@ -3,10 +3,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{DeviceIdentity, IdentityError};
+use crate::{DeviceIdentity, IdentityError, NodeMetrics, SfuMigrationProposal};
 
 const SIGNAL_VERSION: u8 = 1;
-const MAX_SIGNAL_BYTES: usize = 64 * 1024;
+pub const MAX_SIGNAL_BYTES: usize = 32 * 1024;
 const MAX_SIGNAL_AGE_SECONDS: u64 = 5 * 60;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -15,7 +15,13 @@ pub enum CallSignalKind {
     Answer,
     IceCandidate,
     ParticipantState,
+    Capabilities,
+    SfuMetrics,
+    SfuHeartbeat,
+    SfuMigration,
     Leave,
+    DirectSessionHello,
+    DirectMessage,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +70,14 @@ pub enum CallSignalError {
     StaleTimestamp,
     #[error("the participant state payload is invalid")]
     InvalidParticipantState,
+    #[error("the call capabilities payload is invalid")]
+    InvalidCapabilities,
+    #[error("the SFU metrics payload is invalid")]
+    InvalidSfuMetrics,
+    #[error("the SFU heartbeat payload is invalid")]
+    InvalidSfuHeartbeat,
+    #[error("the SFU migration payload is invalid")]
+    InvalidSfuMigration,
     #[error("the call signal signature has an invalid length")]
     InvalidSignatureLength,
     #[error("the call signal could not be serialized: {0}")]
@@ -157,6 +171,22 @@ fn validate_payload(kind: CallSignalKind, payload: &str) -> Result<(), CallSigna
     if kind == CallSignalKind::ParticipantState && !matches!(payload, "join" | "present") {
         return Err(CallSignalError::InvalidParticipantState);
     }
+    if kind == CallSignalKind::Capabilities && !matches!(payload, "video=vp8" | "video=vp8,h264") {
+        return Err(CallSignalError::InvalidCapabilities);
+    }
+    if kind == CallSignalKind::SfuMetrics
+        && NodeMetrics::from_signal_payload("signed-peer", payload).is_none()
+    {
+        return Err(CallSignalError::InvalidSfuMetrics);
+    }
+    if kind == CallSignalKind::SfuHeartbeat && payload != "heartbeat" {
+        return Err(CallSignalError::InvalidSfuHeartbeat);
+    }
+    if kind == CallSignalKind::SfuMigration
+        && SfuMigrationProposal::from_signal_payload(payload).is_none()
+    {
+        return Err(CallSignalError::InvalidSfuMigration);
+    }
     Ok(())
 }
 
@@ -215,6 +245,86 @@ mod tests {
                 100,
             ),
             Err(CallSignalError::InvalidParticipantState)
+        ));
+    }
+
+    #[test]
+    fn capabilities_are_bounded_to_known_video_codecs() {
+        let identity = DeviceIdentity::generate();
+        let signal = CallSignal::create(
+            &identity,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            1,
+            CallSignalKind::Capabilities,
+            "video=vp8,h264".into(),
+            100,
+        )
+        .expect("known capabilities should be accepted");
+        signal.verify(100).expect("capabilities should verify");
+        assert!(matches!(
+            CallSignal::create(
+                &identity,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                2,
+                CallSignalKind::Capabilities,
+                "video=av1".into(),
+                100,
+            ),
+            Err(CallSignalError::InvalidCapabilities)
+        ));
+    }
+
+    #[test]
+    fn sfu_control_signals_reject_unbounded_payloads() {
+        let identity = DeviceIdentity::generate();
+        let metrics = "up=1000;loss=5;rtt=10;cpu=600;gpu=700;enc=1;reach=0";
+        let signal = CallSignal::create(
+            &identity,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            1,
+            CallSignalKind::SfuMetrics,
+            metrics.into(),
+            100,
+        )
+        .expect("valid SFU metrics should be accepted");
+        signal.verify(100).expect("metrics should verify");
+        let migration = CallSignal::create(
+            &identity,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            2,
+            CallSignalKind::SfuMigration,
+            "term=2;from=node1;to=node2".into(),
+            100,
+        )
+        .expect("valid SFU migration should be accepted");
+        migration.verify(100).expect("migration should verify");
+        assert!(matches!(
+            CallSignal::create(
+                &identity,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                2,
+                CallSignalKind::SfuHeartbeat,
+                "wrong".into(),
+                100,
+            ),
+            Err(CallSignalError::InvalidSfuHeartbeat)
+        ));
+        assert!(matches!(
+            CallSignal::create(
+                &identity,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                3,
+                CallSignalKind::SfuMigration,
+                "term=2;from=node1;to=node1".into(),
+                100,
+            ),
+            Err(CallSignalError::InvalidSfuMigration)
         ));
     }
 

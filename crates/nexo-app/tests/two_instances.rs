@@ -6,6 +6,10 @@
 //!   * estado de participante conectado via WebRTC real;
 //!   * encerramento limpo das duas instâncias.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -38,6 +42,10 @@ fn messages_contain(model: &slint::ModelRc<nexo_app::MessageRow>, body: &str) ->
             .row_data(index)
             .is_some_and(|row| row.body.as_str() == body)
     })
+}
+
+fn direct_messages_contain(model: &slint::ModelRc<nexo_app::MessageRow>, body: &str) -> bool {
+    messages_contain(model, body)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -93,6 +101,117 @@ async fn run_scenario() -> anyhow::Result<()> {
     )
     .await?;
 
+    // 4.1) Mensagem direta: a UI deve listar o outro membro e o envio deve
+    // atravessar o sinal autenticado, aparecer no outro app e persistir.
+    wait_for(
+        "A listar o membro para mensagem direta",
+        Duration::from_secs(60),
+        || app_a.window.get_direct_peers().row_count() > 0,
+        || {
+            format!(
+                "A direct-peers={}",
+                app_a.window.get_direct_peers().row_count()
+            )
+        },
+    )
+    .await?;
+    let recipient = app_a
+        .window
+        .get_direct_peers()
+        .row_data(0)
+        .context("destinatário da mensagem direta")?
+        .id
+        .clone();
+    app_a.window.invoke_select_direct_peer(recipient);
+    wait_for(
+        "B listar o membro para mensagem direta",
+        Duration::from_secs(60),
+        || app_b.window.get_direct_peers().row_count() > 0,
+        || {
+            format!(
+                "B direct-peers={}",
+                app_b.window.get_direct_peers().row_count()
+            )
+        },
+    )
+    .await?;
+    let sender = app_b
+        .window
+        .get_direct_peers()
+        .row_data(0)
+        .context("remetente da mensagem direta")?
+        .id
+        .clone();
+    app_b.window.invoke_select_direct_peer(sender);
+    let sent_direct = app_a
+        .window
+        .invoke_send_direct_message("dm do marco 1".into());
+    anyhow::ensure!(sent_direct, "instância A não enfileirou a mensagem direta");
+    wait_for(
+        "B receber a mensagem direta",
+        Duration::from_secs(90),
+        || direct_messages_contain(&app_b.window.get_direct_messages(), "dm do marco 1"),
+        || {
+            format!(
+                "A status={} | B status={} | B direct-msgs={}",
+                app_a.window.get_status_text(),
+                app_b.window.get_status_text(),
+                app_b.window.get_direct_messages().row_count()
+            )
+        },
+    )
+    .await?;
+
+    // 4.2) B sai da rede. A ainda deve conseguir criar a mensagem, persistindo
+    // o envelope cifrado para a próxima sincronização.
+    app_b.shutdown();
+    drop(app_b);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let sent_offline = app_a
+        .window
+        .invoke_send_direct_message("dm offline do marco 1".into());
+    anyhow::ensure!(sent_offline, "instância A não enfileirou a DM offline");
+    wait_for(
+        "A persistir a DM offline",
+        Duration::from_secs(30),
+        || direct_messages_contain(&app_a.window.get_direct_messages(), "dm offline do marco 1"),
+        || format!("A status={}", app_a.window.get_status_text()),
+    )
+    .await?;
+
+    // B retorna usando a mesma identidade/banco e deve receber o envelope pela
+    // página de sincronização, sem que A reenvie o texto em claro.
+    let mut app_b = nexo_app::start_app(&dir_b).context("reiniciar instância B")?;
+    wait_for(
+        "B reconectar à comunidade após reinício",
+        Duration::from_secs(60),
+        || app_b.window.get_direct_peers().row_count() > 0,
+        || format!("B status={}", app_b.window.get_status_text()),
+    )
+    .await?;
+    let sender = app_b
+        .window
+        .get_direct_peers()
+        .row_data(0)
+        .context("remetente da DM offline")?
+        .id
+        .clone();
+    app_b.window.invoke_select_direct_peer(sender);
+    wait_for(
+        "B sincronizar a DM offline",
+        Duration::from_secs(90),
+        || direct_messages_contain(&app_b.window.get_direct_messages(), "dm offline do marco 1"),
+        || {
+            format!(
+                "A status={} | B status={} | B direct-msgs={}",
+                app_a.window.get_status_text(),
+                app_b.window.get_status_text(),
+                app_b.window.get_direct_messages().row_count()
+            )
+        },
+    )
+    .await?;
+
     // 4) B recebe o histórico da comunidade criada antes da conexão.
     wait_for(
         "instância B receber a mensagem via conexão tardia",
@@ -142,7 +261,20 @@ async fn run_scenario() -> anyhow::Result<()> {
 
     // 6) Controles de chamada: A entra na voz primeiro.
     app_a.window.invoke_join_call();
-    anyhow::ensure!(app_a.window.get_call_active(), "A deveria estar na voz");
+    wait_for(
+        "A iniciar a chamada",
+        Duration::from_secs(30),
+        || app_a.window.get_call_active(),
+        || {
+            format!(
+                "A call-active={} starting={} status={}",
+                app_a.window.get_call_active(),
+                app_a.window.get_call_starting(),
+                app_a.window.get_call_status()
+            )
+        },
+    )
+    .await?;
     wait_for(
         "motor de voz de A pronto",
         Duration::from_secs(30),
@@ -157,9 +289,40 @@ async fn run_scenario() -> anyhow::Result<()> {
     )
     .await?;
 
+    // The call controls must update immediately while the command is being
+    // processed by the media thread; this prevents a slow device from making
+    // a button appear unresponsive.
+    anyhow::ensure!(
+        app_a.window.get_video_enabled(),
+        "camera should start enabled"
+    );
+    app_a.window.invoke_toggle_video();
+    anyhow::ensure!(
+        !app_a.window.get_video_enabled(),
+        "camera button should disable video immediately"
+    );
+    app_a.window.invoke_toggle_video();
+    anyhow::ensure!(
+        app_a.window.get_video_enabled(),
+        "camera button should re-enable video immediately"
+    );
+
     // 6) B entra na voz; a negociação WebRTC real deve conectar os dois.
     app_b.window.invoke_join_call();
-    anyhow::ensure!(app_b.window.get_call_active(), "B deveria estar na voz");
+    wait_for(
+        "B iniciar a chamada",
+        Duration::from_secs(30),
+        || app_b.window.get_call_active(),
+        || {
+            format!(
+                "B call-active={} starting={} status={}",
+                app_b.window.get_call_active(),
+                app_b.window.get_call_starting(),
+                app_b.window.get_call_status()
+            )
+        },
+    )
+    .await?;
     wait_for(
         "A enxergar 1 participante conectado via WebRTC",
         Duration::from_secs(90),
@@ -264,12 +427,19 @@ async fn run_scenario() -> anyhow::Result<()> {
 #[test]
 fn two_instances_share_community_history_and_voice() {
     i_slint_backend_testing::init_integration_test_with_system_time();
+    let scenario_failed = Arc::new(AtomicBool::new(false));
+    let scenario_failed_task = Arc::clone(&scenario_failed);
     slint::spawn_local(Compat::new(async move {
         if let Err(error) = run_scenario().await {
             eprintln!("two-instances scenario failed: {error:#}");
+            scenario_failed_task.store(true, Ordering::Release);
             let _ = slint::quit_event_loop();
         }
     }))
     .expect("spawn scenario on the Slint event loop");
     slint::run_event_loop().expect("run Slint event loop");
+    assert!(
+        !scenario_failed.load(Ordering::Acquire),
+        "two-instances scenario failed; see the diagnostic above"
+    );
 }

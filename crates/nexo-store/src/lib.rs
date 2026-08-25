@@ -1,15 +1,28 @@
 use std::path::Path;
 
 use nexo_core::{
-    CallSignal, CommunityCredential, FileTransferOffer, MessageError, SignedMessage,
-    community_sync_token,
+    CallSignal, CommunityCredential, DirectMessageEnvelope, FileTransferOffer, MessageError,
+    MlsCommit, MlsGroupState, SignedMessage, community_sync_token, current_timestamp,
+    direct_conversation_id,
 };
 use rusqlite::{Connection, OptionalExtension as _, params};
+use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 use thiserror::Error;
 use uuid::Uuid;
 
 const DEFAULT_CHANNEL_NAME: &str = "geral";
 const DEFAULT_CHANNEL_NAMESPACE: Uuid = Uuid::from_u128(0x3a6b_9561_66fd_4f9e_8bb4_1cf2_e033_ea97);
+const CHANNEL_NAMESPACE: Uuid = Uuid::from_u128(0x5c5a_1f6a_0e46_4a0b_8f08_0d1e_7a55_2b4c);
+
+fn member_device_id(public_key: &[u8; 32]) -> String {
+    let mut value = String::with_capacity(16);
+    for byte in &public_key[..8] {
+        use std::fmt::Write as _;
+        let _ = write!(value, "{byte:02x}");
+    }
+    value
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Community {
@@ -18,7 +31,7 @@ pub struct Community {
     pub default_channel_id: Uuid,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ChannelKind {
     Text,
     Voice,
@@ -46,7 +59,7 @@ impl std::str::FromStr for ChannelKind {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Channel {
     pub id: Uuid,
     pub community_id: Uuid,
@@ -71,6 +84,12 @@ pub struct StoredFileTransfer {
     pub status: String,
     pub downloaded_chunks: u32,
     pub created_at: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredDirectMessage {
+    pub envelope: DirectMessageEnvelope,
+    pub body: String,
 }
 
 #[derive(Debug, Error)]
@@ -131,6 +150,12 @@ impl LocalStore {
                  authorized_at INTEGER NOT NULL,
                  PRIMARY KEY(community_id, public_key)
              );
+             CREATE TABLE IF NOT EXISTS revoked_members (
+                 community_id TEXT NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+                 public_key BLOB NOT NULL,
+                 revoked_at INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY(community_id, public_key)
+             );
              CREATE TABLE IF NOT EXISTS credentials (
                  community_id TEXT NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
                  member_key BLOB NOT NULL,
@@ -155,14 +180,54 @@ impl LocalStore {
                  message_id TEXT NOT NULL,
                  PRIMARY KEY(peer_id, receiver_epoch, community_id, message_id)
              );
-             CREATE TABLE IF NOT EXISTS call_signals_seen (
-                 id TEXT PRIMARY KEY NOT NULL,
+             CREATE TABLE IF NOT EXISTS direct_sync_deliveries (
+                 peer_id TEXT NOT NULL,
+                 receiver_epoch TEXT NOT NULL,
                  community_id TEXT NOT NULL,
-                 call_id TEXT NOT NULL,
-                 author_key BLOB NOT NULL,
-                 sequence INTEGER NOT NULL,
-                 received_at INTEGER NOT NULL
+                 message_id TEXT NOT NULL,
+                 PRIMARY KEY(peer_id, receiver_epoch, community_id, message_id)
              );
+             CREATE TABLE IF NOT EXISTS direct_sync_pending (
+                 peer_id TEXT NOT NULL,
+                 receiver_epoch TEXT NOT NULL,
+                 community_id TEXT NOT NULL,
+                 message_id TEXT NOT NULL,
+                 PRIMARY KEY(peer_id, receiver_epoch, community_id, message_id)
+             );
+              CREATE TABLE IF NOT EXISTS call_signals_seen (
+                  id TEXT PRIMARY KEY NOT NULL,
+                  community_id TEXT NOT NULL,
+                  call_id TEXT NOT NULL,
+                  author_key BLOB NOT NULL,
+                  sequence INTEGER NOT NULL,
+                  received_at INTEGER NOT NULL
+              );
+              CREATE INDEX IF NOT EXISTS call_signals_seen_received_at
+                  ON call_signals_seen(received_at);
+             CREATE TABLE IF NOT EXISTS direct_messages (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 community_id TEXT NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+                 conversation_id TEXT NOT NULL,
+                 sender_key BLOB NOT NULL,
+                 recipient_key BLOB NOT NULL,
+                 body TEXT NOT NULL,
+                 envelope_json TEXT NOT NULL,
+                 created_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS direct_messages_timeline
+                 ON direct_messages(conversation_id, created_at, id);
+             CREATE TABLE IF NOT EXISTS mls_groups (
+                 community_id TEXT PRIMARY KEY NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+                 state_json TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS mls_commits (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 community_id TEXT NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+                 epoch INTEGER NOT NULL,
+                 commit_json TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS mls_commits_epoch
+                 ON mls_commits(community_id, epoch, id);
              CREATE TABLE IF NOT EXISTS file_transfers (
                  id TEXT PRIMARY KEY NOT NULL,
                  community_id TEXT NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
@@ -269,7 +334,28 @@ impl LocalStore {
         name: &str,
         kind: ChannelKind,
     ) -> Result<Channel, StoreError> {
-        let channel_id = Uuid::new_v4();
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(StoreError::InvalidData(
+                "channel name cannot be empty".to_owned(),
+            ));
+        }
+        if let Some(existing) = self
+            .channels(community_id)?
+            .into_iter()
+            .find(|channel| channel.name.eq_ignore_ascii_case(name))
+        {
+            if existing.kind != kind {
+                self.connection.execute(
+                    "UPDATE channels SET kind = ?1 WHERE id = ?2",
+                    params![kind.as_str(), existing.id.to_string()],
+                )?;
+                return Ok(Channel { kind, ..existing });
+            }
+            return Ok(existing);
+        }
+        let channel_key = format!("{}:{}", community_id, name.to_ascii_lowercase());
+        let channel_id = Uuid::new_v5(&CHANNEL_NAMESPACE, channel_key.as_bytes());
         let max_pos: i64 = self
             .connection
             .query_row(
@@ -325,12 +411,42 @@ impl LocalStore {
         Ok(result)
     }
 
+    /// Import a channel definition while preserving its stable identifier.
+    /// Channel metadata is bounded by the sync protocol and messages still
+    /// require a valid community signature before they are stored.
+    pub fn import_channel(&self, channel: &Channel) -> Result<(), StoreError> {
+        if self.community(channel.community_id)?.is_none() {
+            return Err(StoreError::InvalidData(
+                "unknown channel community".to_owned(),
+            ));
+        }
+        self.connection.execute(
+            "INSERT INTO channels(id, community_id, name, position, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+                 name = excluded.name, position = excluded.position, kind = excluded.kind",
+            params![
+                channel.id.to_string(),
+                channel.community_id.to_string(),
+                channel.name,
+                i64::from(channel.position),
+                channel.kind.as_str()
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn authorize_member(
         &self,
         community_id: Uuid,
         public_key: &[u8; 32],
         authorized_at: u64,
     ) -> Result<(), StoreError> {
+        if self.is_revoked_member(community_id, public_key)? {
+            return Err(StoreError::InvalidData(
+                "member is revoked in this community".to_owned(),
+            ));
+        }
         self.connection.execute(
             "INSERT OR IGNORE INTO members(community_id, public_key, authorized_at)
              VALUES (?1, ?2, ?3)",
@@ -341,6 +457,135 @@ impl LocalStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// Load or create the local MLS membership state. Existing databases are
+    /// bootstrapped deterministically from their authorized member set so all
+    /// peers converge before the first exchanged commit.
+    pub fn ensure_mls_group(
+        &self,
+        community_id: Uuid,
+        founder_device_id: String,
+        founder_key: [u8; 32],
+        member_keys: &[[u8; 32]],
+    ) -> Result<MlsGroupState, StoreError> {
+        let mut initial_secret = [0u8; 32];
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"nexo-legacy-mls-group-secret-v1");
+        hasher.update(community_id.as_bytes());
+        hasher.update(founder_key);
+        initial_secret.copy_from_slice(&hasher.finalize());
+        self.ensure_mls_group_with_secret(
+            community_id,
+            founder_device_id,
+            founder_key,
+            member_keys,
+            initial_secret,
+        )
+    }
+
+    pub fn ensure_mls_group_with_secret(
+        &self,
+        community_id: Uuid,
+        founder_device_id: String,
+        founder_key: [u8; 32],
+        member_keys: &[[u8; 32]],
+        initial_secret: [u8; 32],
+    ) -> Result<MlsGroupState, StoreError> {
+        if let Some(state) = self.mls_group(community_id)? {
+            return Ok(state);
+        }
+        let mut state = MlsGroupState::new_with_secret(
+            community_id,
+            founder_device_id,
+            founder_key,
+            initial_secret,
+        );
+        let mut additional = member_keys
+            .iter()
+            .copied()
+            .filter(|key| *key != founder_key)
+            .collect::<Vec<_>>();
+        additional.sort_unstable();
+        for key in additional {
+            state.add_member(member_device_id(&key), key);
+        }
+        self.save_mls_group(&state)?;
+        Ok(state)
+    }
+
+    pub fn mls_group(&self, community_id: Uuid) -> Result<Option<MlsGroupState>, StoreError> {
+        let value = self
+            .connection
+            .query_row(
+                "SELECT state_json FROM mls_groups WHERE community_id = ?1",
+                [community_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        value
+            .map(|value| {
+                serde_json::from_str(&value)
+                    .map_err(|error| StoreError::InvalidData(error.to_string()))
+            })
+            .transpose()
+    }
+
+    pub fn save_mls_group(&self, state: &MlsGroupState) -> Result<(), StoreError> {
+        let state_json = serde_json::to_string(state)
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        self.connection.execute(
+            "INSERT INTO mls_groups(community_id, state_json)
+             VALUES (?1, ?2)
+             ON CONFLICT(community_id) DO UPDATE SET state_json = excluded.state_json",
+            params![state.group_id.to_string(), state_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_mls_commit(&self, commit: &MlsCommit) -> Result<bool, StoreError> {
+        commit
+            .verify_signature()
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let commit_json = serde_json::to_string(commit)
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let inserted = self.connection.execute(
+            "INSERT OR IGNORE INTO mls_commits(id, community_id, epoch, commit_json)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                commit.id.to_string(),
+                commit.group_id.to_string(),
+                i64::try_from(commit.epoch).map_err(|_| {
+                    StoreError::InvalidData("MLS epoch exceeds SQLite integer range".to_owned())
+                })?,
+                commit_json
+            ],
+        )?;
+        Ok(inserted > 0)
+    }
+
+    pub fn has_mls_commit(&self, commit_id: Uuid) -> Result<bool, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM mls_commits WHERE id = ?1)",
+                [commit_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
+    }
+
+    pub fn mls_commits(&self, community_id: Uuid) -> Result<Vec<MlsCommit>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT commit_json FROM mls_commits
+             WHERE community_id = ?1 ORDER BY epoch, id",
+        )?;
+        let rows =
+            statement.query_map([community_id.to_string()], |row| row.get::<_, String>(0))?;
+        rows.map(|row| {
+            let value = row?;
+            serde_json::from_str(&value).map_err(|error| StoreError::InvalidData(error.to_string()))
+        })
+        .collect()
     }
 
     pub fn is_authorized_member(
@@ -399,6 +644,89 @@ impl LocalStore {
         Ok(inserted == 1)
     }
 
+    /// Store the decrypted local view while retaining the signed ciphertext envelope.
+    pub fn record_direct_message(
+        &self,
+        envelope: &DirectMessageEnvelope,
+        body: &str,
+        local_key: &[u8; 32],
+        _now: u64,
+    ) -> Result<bool, StoreError> {
+        envelope
+            .verify_signature()
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        if self.community(envelope.community_id)?.is_none()
+            || !self.is_authorized_member(envelope.community_id, &envelope.sender_key)?
+            || !self.is_authorized_member(envelope.community_id, &envelope.recipient_key)?
+            || (local_key != &envelope.sender_key && local_key != &envelope.recipient_key)
+        {
+            return Err(StoreError::UnauthorizedAuthor);
+        }
+        if envelope.conversation_id
+            != direct_conversation_id(
+                envelope.community_id,
+                envelope.sender_key,
+                envelope.recipient_key,
+            )
+        {
+            return Err(StoreError::InvalidData(
+                "direct message conversation id is invalid".to_owned(),
+            ));
+        }
+        let envelope_json = serde_json::to_string(envelope)
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let inserted = self.connection.execute(
+            "INSERT OR IGNORE INTO direct_messages(
+                 id, community_id, conversation_id, sender_key, recipient_key,
+                 body, envelope_json, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                envelope.id.to_string(),
+                envelope.community_id.to_string(),
+                envelope.conversation_id.to_string(),
+                envelope.sender_key.as_slice(),
+                envelope.recipient_key.as_slice(),
+                body,
+                envelope_json,
+                to_i64(envelope.created_at)?,
+            ],
+        )?;
+        Ok(inserted == 1)
+    }
+
+    pub fn direct_messages(
+        &self,
+        conversation_id: Uuid,
+        limit: usize,
+        _now: u64,
+    ) -> Result<Vec<StoredDirectMessage>, StoreError> {
+        let limit = i64::try_from(limit.min(500))
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let mut statement = self.connection.prepare(
+            "SELECT envelope_json, body FROM (
+                 SELECT id, envelope_json, body, created_at FROM direct_messages
+                 WHERE conversation_id = ?1
+                 ORDER BY created_at DESC, id DESC LIMIT ?2
+             ) ORDER BY created_at, id",
+        )?;
+        let rows = statement.query_map(params![conversation_id.to_string(), limit], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut messages = Vec::new();
+        for row in rows {
+            let Ok((envelope_json, body)) = row else {
+                continue;
+            };
+            let Ok(envelope) = serde_json::from_str::<DirectMessageEnvelope>(&envelope_json) else {
+                continue;
+            };
+            if envelope.conversation_id == conversation_id && envelope.verify_signature().is_ok() {
+                messages.push(StoredDirectMessage { envelope, body });
+            }
+        }
+        Ok(messages)
+    }
+
     /// Delete call signals recorded before `older_than_timestamp` to prevent
     /// unbounded table growth.
     pub fn prune_old_call_signals(&self, older_than_timestamp: u64) -> Result<usize, StoreError> {
@@ -416,10 +744,32 @@ impl LocalStore {
             params![community_id.to_string(), member_key],
         )?;
         self.connection.execute(
-            "DELETE FROM credentials WHERE community_id = ?1 AND member_key = ?2",
-            params![community_id.to_string(), member_key],
+            "INSERT OR IGNORE INTO revoked_members(community_id, public_key, revoked_at)
+             VALUES (?1, ?2, ?3)",
+            params![
+                community_id.to_string(),
+                member_key,
+                to_i64(current_timestamp())?
+            ],
         )?;
         Ok(deleted_member > 0)
+    }
+
+    pub fn is_revoked_member(
+        &self,
+        community_id: Uuid,
+        member_key: &[u8; 32],
+    ) -> Result<bool, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM revoked_members
+                     WHERE community_id = ?1 AND public_key = ?2
+                 )",
+                params![community_id.to_string(), member_key.as_slice()],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(StoreError::from)
     }
 
     /// Record a file transfer offer into the local database.
@@ -608,6 +958,11 @@ impl LocalStore {
     }
 
     pub fn save_credential(&self, credential: &CommunityCredential) -> Result<(), StoreError> {
+        if self.is_revoked_member(credential.invite.network_id, &credential.member_key)? {
+            return Err(StoreError::InvalidData(
+                "member is revoked in this community".to_owned(),
+            ));
+        }
         let credential_json = serde_json::to_string(credential)
             .map_err(|error| StoreError::InvalidData(error.to_string()))?;
         self.connection.execute(
@@ -653,6 +1008,11 @@ impl LocalStore {
         {
             return Err(StoreError::InvalidData(
                 "unknown community credential".to_owned(),
+            ));
+        }
+        if self.is_revoked_member(community_id, &credential.member_key)? {
+            return Err(StoreError::InvalidData(
+                "member is revoked in this community".to_owned(),
             ));
         }
         self.authorize_member(
@@ -704,7 +1064,7 @@ impl LocalStore {
         limit: usize,
         now: u64,
     ) -> Result<(Vec<SignedMessage>, bool), StoreError> {
-        let community = self
+        let _community = self
             .community(community_id)?
             .ok_or_else(|| StoreError::InvalidData("unknown community".to_owned()))?;
         let fetch = limit.min(500).saturating_add(1);
@@ -713,7 +1073,7 @@ impl LocalStore {
         let mut statement = self.connection.prepare(
             "SELECT id, version, community_id, channel_id, author_key, body, created_at, signature
              FROM messages m
-             WHERE channel_id = ?1 AND NOT EXISTS (
+            WHERE m.community_id = ?1 AND NOT EXISTS (
                  SELECT 1 FROM sync_deliveries d
                  WHERE d.peer_id = ?2 AND d.receiver_epoch = ?3
                    AND d.community_id = ?4 AND d.message_id = m.id
@@ -722,7 +1082,7 @@ impl LocalStore {
         )?;
         let rows = statement.query_map(
             params![
-                community.default_channel_id.to_string(),
+                community_id.to_string(),
                 peer_id,
                 receiver_epoch.to_string(),
                 community_id.to_string(),
@@ -762,6 +1122,191 @@ impl LocalStore {
         let has_more = messages.len() > limit;
         messages.truncate(limit);
         Ok((messages, has_more))
+    }
+
+    /// Return encrypted direct-message envelopes addressed to one peer that
+    /// have not yet been acknowledged for this database epoch.
+    pub fn sync_direct_page(
+        &self,
+        peer_id: &str,
+        receiver_epoch: Uuid,
+        community_id: Uuid,
+        recipient_key: &[u8; 32],
+        limit: usize,
+    ) -> Result<(Vec<DirectMessageEnvelope>, bool), StoreError> {
+        let _community = self
+            .community(community_id)?
+            .ok_or_else(|| StoreError::InvalidData("unknown community".to_owned()))?;
+        let fetch = limit.min(500).saturating_add(1);
+        let fetch =
+            i64::try_from(fetch).map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, envelope_json FROM direct_messages dm
+             WHERE dm.community_id = ?1 AND dm.recipient_key = ?2
+               AND NOT EXISTS (
+                   SELECT 1 FROM direct_sync_deliveries d
+                   WHERE d.peer_id = ?3 AND d.receiver_epoch = ?4
+                     AND d.community_id = ?5 AND d.message_id = dm.id
+               )
+             ORDER BY dm.created_at, dm.id LIMIT ?6",
+        )?;
+        let rows = statement.query_map(
+            params![
+                community_id.to_string(),
+                recipient_key.as_slice(),
+                peer_id,
+                receiver_epoch.to_string(),
+                community_id.to_string(),
+                fetch,
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        let mut envelopes = Vec::new();
+        for row in rows {
+            let (_id, value) = row?;
+            let envelope = serde_json::from_str::<DirectMessageEnvelope>(&value)
+                .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+            if envelope.community_id == community_id
+                && envelope.recipient_key == *recipient_key
+                && envelope.conversation_id
+                    == direct_conversation_id(
+                        community_id,
+                        envelope.sender_key,
+                        envelope.recipient_key,
+                    )
+                && envelope.verify_signature().is_ok()
+            {
+                envelopes.push(envelope);
+            }
+        }
+        let has_more = envelopes.len() > limit;
+        envelopes.truncate(limit);
+        Ok((envelopes, has_more))
+    }
+
+    /// Return authenticated MLS commits that have not yet been acknowledged
+    /// by this peer and database epoch.
+    pub fn sync_mls_page(
+        &self,
+        peer_id: &str,
+        receiver_epoch: Uuid,
+        community_id: Uuid,
+        limit: usize,
+    ) -> Result<(Vec<MlsCommit>, bool), StoreError> {
+        let _community = self
+            .community(community_id)?
+            .ok_or_else(|| StoreError::InvalidData("unknown community".to_owned()))?;
+        let fetch = limit.min(500).saturating_add(1);
+        let fetch =
+            i64::try_from(fetch).map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let mut statement = self.connection.prepare(
+            "SELECT commit_json FROM mls_commits mc
+             WHERE mc.community_id = ?1 AND NOT EXISTS (
+                 SELECT 1 FROM sync_deliveries d
+                 WHERE d.peer_id = ?2 AND d.receiver_epoch = ?3
+                   AND d.community_id = ?1 AND d.message_id = mc.id
+             )
+             ORDER BY mc.epoch, mc.id LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            params![
+                community_id.to_string(),
+                peer_id,
+                receiver_epoch.to_string(),
+                fetch
+            ],
+            |row| row.get::<_, String>(0),
+        )?;
+        let mut commits = Vec::new();
+        for row in rows {
+            let value = row?;
+            let commit = serde_json::from_str::<MlsCommit>(&value)
+                .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+            if commit.group_id == community_id && commit.verify_signature().is_ok() {
+                commits.push(commit);
+            }
+        }
+        let has_more = commits.len() > limit;
+        commits.truncate(limit);
+        Ok((commits, has_more))
+    }
+
+    pub fn record_pending_direct(
+        &self,
+        peer_id: &str,
+        receiver_epoch: Uuid,
+        community_id: Uuid,
+        message_ids: &[Uuid],
+    ) -> Result<(), StoreError> {
+        for message_id in message_ids {
+            self.connection.execute(
+                "INSERT OR IGNORE INTO direct_sync_pending(
+                     peer_id, receiver_epoch, community_id, message_id
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    peer_id,
+                    receiver_epoch.to_string(),
+                    community_id.to_string(),
+                    message_id.to_string()
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn acknowledge_pending_direct(
+        &self,
+        peer_id: &str,
+        receiver_epoch: Uuid,
+        community_id: Uuid,
+        message_ids: &[Uuid],
+    ) -> Result<usize, StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let mut accepted = 0;
+        for message_id in message_ids {
+            let pending = transaction.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM direct_sync_pending
+                     WHERE peer_id = ?1 AND receiver_epoch = ?2
+                       AND community_id = ?3 AND message_id = ?4
+                 )",
+                params![
+                    peer_id,
+                    receiver_epoch.to_string(),
+                    community_id.to_string(),
+                    message_id.to_string()
+                ],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !pending {
+                continue;
+            }
+            transaction.execute(
+                "INSERT OR IGNORE INTO direct_sync_deliveries(
+                     peer_id, receiver_epoch, community_id, message_id
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    peer_id,
+                    receiver_epoch.to_string(),
+                    community_id.to_string(),
+                    message_id.to_string()
+                ],
+            )?;
+            transaction.execute(
+                "DELETE FROM direct_sync_pending
+                 WHERE peer_id = ?1 AND receiver_epoch = ?2
+                   AND community_id = ?3 AND message_id = ?4",
+                params![
+                    peer_id,
+                    receiver_epoch.to_string(),
+                    community_id.to_string(),
+                    message_id.to_string()
+                ],
+            )?;
+            accepted += 1;
+        }
+        transaction.commit()?;
+        Ok(accepted)
     }
 
     pub fn record_pending(
@@ -853,10 +1398,32 @@ impl LocalStore {
             .1)
     }
 
+    pub fn import_messages_with_mls(
+        &self,
+        community_id: Uuid,
+        messages: &[SignedMessage],
+        mls_state: Option<&MlsGroupState>,
+        now: u64,
+    ) -> Result<usize, StoreError> {
+        Ok(self
+            .import_messages_accepted_with_mls(community_id, messages, mls_state, now)?
+            .1)
+    }
+
     pub fn import_messages_accepted(
         &self,
         community_id: Uuid,
         messages: &[SignedMessage],
+        now: u64,
+    ) -> Result<(Vec<Uuid>, usize), StoreError> {
+        self.import_messages_accepted_with_mls(community_id, messages, None, now)
+    }
+
+    pub fn import_messages_accepted_with_mls(
+        &self,
+        community_id: Uuid,
+        messages: &[SignedMessage],
+        mls_state: Option<&MlsGroupState>,
         now: u64,
     ) -> Result<(Vec<Uuid>, usize), StoreError> {
         let mut accepted = Vec::new();
@@ -865,7 +1432,7 @@ impl LocalStore {
             if message.community_id != community_id {
                 continue;
             }
-            match self.insert_message(message, now) {
+            match self.insert_message_with_mls(message, mls_state, now) {
                 Ok(true) => {
                     inserted += 1;
                     accepted.push(message.id);
@@ -908,7 +1475,24 @@ impl LocalStore {
     }
 
     pub fn insert_message(&self, message: &SignedMessage, now: u64) -> Result<bool, StoreError> {
+        self.insert_message_with_mls(message, None, now)
+    }
+
+    pub fn insert_message_with_mls(
+        &self,
+        message: &SignedMessage,
+        mls_state: Option<&MlsGroupState>,
+        now: u64,
+    ) -> Result<bool, StoreError> {
         message.verify(now)?;
+        if message.version == 2 {
+            let Some(mls_state) = mls_state else {
+                return Err(StoreError::InvalidData(
+                    "encrypted community message has no MLS state".to_owned(),
+                ));
+            };
+            message.decrypt_body(mls_state)?;
+        }
         let community_id = message.community_id.to_string();
         let channel_owner: Option<String> = self
             .connection
@@ -1130,7 +1714,63 @@ fn to_i64(value: u64) -> Result<i64, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nexo_core::{CommunityCredential, DeviceIdentity, NetworkInvite};
+    use nexo_core::{
+        CommunityCredential, DeviceIdentity, DoubleRatchetSession, MlsCommit, NetworkInvite,
+        direct_conversation_id, public_key_from_private,
+    };
+
+    #[test]
+    fn direct_messages_are_persisted_once_and_survive_signal_expiry() {
+        let path = std::env::temp_dir().join(format!("nexo-dm-{}.sqlite3", Uuid::new_v4()));
+        let alice = DeviceIdentity::generate();
+        let bob = DeviceIdentity::generate();
+        let community_id = Uuid::new_v4();
+        let mut store = LocalStore::open(&path).expect("store should open");
+        let community = store
+            .create_community(community_id, "DM", 100)
+            .expect("community should exist");
+        store
+            .authorize_member(community_id, &alice.public_key_bytes(), 100)
+            .expect("alice should be authorized");
+        store
+            .authorize_member(community_id, &bob.public_key_bytes(), 100)
+            .expect("bob should be authorized");
+        let mut ratchet = DoubleRatchetSession::initialize_initiator(
+            [9_u8; 32],
+            public_key_from_private([31_u8; 32]),
+        );
+        let conversation_id = direct_conversation_id(
+            community_id,
+            alice.public_key_bytes(),
+            bob.public_key_bytes(),
+        );
+        let envelope = DirectMessageEnvelope::create(
+            &alice,
+            community_id,
+            conversation_id,
+            bob.public_key_bytes(),
+            ratchet.encrypt(b"persisted"),
+            100,
+        )
+        .expect("envelope should exist");
+        assert!(
+            store
+                .record_direct_message(&envelope, "persisted", &alice.public_key_bytes(), 100)
+                .expect("message should be stored")
+        );
+        assert!(
+            !store
+                .record_direct_message(&envelope, "persisted", &alice.public_key_bytes(), 100)
+                .expect("duplicate should be ignored")
+        );
+        let messages = store
+            .direct_messages(conversation_id, 50, 100 + 3600)
+            .expect("messages should load");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].body, "persisted");
+        assert_eq!(messages[0].envelope.community_id, community.id);
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn community_and_signed_messages_survive_reopen() {
@@ -1172,6 +1812,60 @@ mod tests {
             .expect("messages should load");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].body, "mensagem persistente");
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mls_epoch_and_commit_history_survive_reopen() {
+        let path = std::env::temp_dir().join(format!("nexo-mls-{}.sqlite3", Uuid::new_v4()));
+        let alice = DeviceIdentity::generate();
+        let bob = DeviceIdentity::generate();
+        let community_id = Uuid::new_v4();
+        {
+            let mut store = LocalStore::open(&path).expect("store should open");
+            store
+                .create_community(community_id, "MLS", 100)
+                .expect("community should be created");
+            store
+                .authorize_member(community_id, &alice.public_key_bytes(), 100)
+                .expect("alice should be authorized");
+            store
+                .authorize_member(community_id, &bob.public_key_bytes(), 101)
+                .expect("bob should be authorized");
+            let mut state = store
+                .ensure_mls_group(
+                    community_id,
+                    "alice".to_owned(),
+                    alice.public_key_bytes(),
+                    &[alice.public_key_bytes()],
+                )
+                .expect("MLS group should initialize");
+            let commit =
+                MlsCommit::create_add(&alice, &state, "bob".to_owned(), bob.public_key_bytes())
+                    .expect("commit should be signed");
+            state
+                .apply_commit(&commit)
+                .expect("commit should advance the group");
+            store
+                .save_mls_commit(&commit)
+                .expect("commit should persist");
+            store.save_mls_group(&state).expect("state should persist");
+            assert_eq!(state.epoch, 1);
+        }
+
+        let store = LocalStore::open(&path).expect("store should reopen");
+        let state = store
+            .mls_group(community_id)
+            .expect("MLS group should load")
+            .expect("MLS group should exist");
+        let commits = store
+            .mls_commits(community_id)
+            .expect("MLS commits should load");
+        assert_eq!(state.epoch, 1);
+        assert!(state.contains_member(&bob.public_key_bytes()));
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].epoch, state.epoch);
         drop(store);
         let _ = std::fs::remove_file(path);
     }
@@ -1496,6 +2190,16 @@ mod tests {
                 .is_authorized_member(community_id, &member.public_key_bytes())
                 .expect("member should not be authorized")
         );
+        assert!(
+            store
+                .is_revoked_member(community_id, &member.public_key_bytes())
+                .expect("revocation marker should persist")
+        );
+        assert!(
+            store
+                .authorize_member(community_id, &member.public_key_bytes(), now)
+                .is_err()
+        );
 
         drop(store);
         let _ = std::fs::remove_file(path);
@@ -1586,6 +2290,11 @@ mod tests {
         let c_anuncios = store
             .create_channel(community.id, "anuncios", ChannelKind::Text)
             .expect("anuncios created");
+        let c_anuncios_again = store
+            .create_channel(community.id, "Anuncios", ChannelKind::Voice)
+            .expect("existing channel creation is idempotent");
+        assert_eq!(c_anuncios.id, c_anuncios_again.id);
+        assert_eq!(c_anuncios_again.kind, ChannelKind::Voice);
         let c_voz1 = store
             .create_channel(community.id, "Sala de Voz 1", ChannelKind::Voice)
             .expect("voz 1 created");
@@ -1604,5 +2313,29 @@ mod tests {
 
         drop(store);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn custom_channel_ids_converge_across_independent_stores() {
+        let mut first = LocalStore::open(Path::new(":memory:")).expect("first store opens");
+        let mut second = LocalStore::open(Path::new(":memory:")).expect("second store opens");
+        let community_id = Uuid::new_v4();
+        first
+            .create_community(community_id, "Convergencia", 100)
+            .expect("first community is created");
+        second
+            .create_community(community_id, "Convergencia", 100)
+            .expect("second community is created");
+
+        let first_channel = first
+            .create_channel(community_id, "Anuncios", ChannelKind::Text)
+            .expect("first channel is created");
+        let second_channel = second
+            .create_channel(community_id, "anuncios", ChannelKind::Text)
+            .expect("second channel is created");
+
+        assert_eq!(first_channel.id, second_channel.id);
+        assert_eq!(first_channel.name, "Anuncios");
+        assert_eq!(second_channel.name, "anuncios");
     }
 }

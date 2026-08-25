@@ -4,9 +4,9 @@
 //!
 //! The workspace forbids `unsafe` code (see `AGENTS.md`). This crate is the
 //! single documented exception: the Windows backend in [`platform::windows`]
-//! talks to Media Foundation (camera enumeration, hardware MFT encoder
-//! detection), DXGI (GPU description) and AMF (AMD runtime detection) through
-//! the official `windows` crate. Every native call is isolated inside that one
+//! talks to Media Foundation (camera enumeration and hardware MFT encoder
+//! detection) and DXGI (GPU description) through the official `windows` crate.
+//! Every native call is isolated inside that one
 //! module behind safe, panic-free functions; all other modules of this crate
 //! (and of the rest of the workspace) remain `unsafe`-free.
 //!
@@ -16,12 +16,15 @@
 
 mod capture;
 mod devices;
+mod encoder;
+mod frame_worker;
 mod platform;
 mod probe;
 mod screen;
 
 pub use capture::{PixelFormat, VideoCaptureSource, VideoFrame};
 pub use devices::{VideoDeviceInfo, VideoError, enumerate_cameras};
+pub use encoder::{EncodedH264Frame, HardwareH264Encoder};
 pub use probe::{
     AccelerationApi, CapabilityProbe, CapabilityReport, CaptureBackend, CodecCapability, MediaKind,
 };

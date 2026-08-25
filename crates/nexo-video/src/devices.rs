@@ -45,6 +45,12 @@ impl VideoError {
         ))
     }
 
+    /// Build an error from the native video encoder backend.
+    #[must_use]
+    pub fn encoder(message: impl Into<String>) -> Self {
+        Self(format!("falha no encoder de video: {}", message.into()))
+    }
+
     /// Build an error from the screen capture backend.
     #[must_use]
     pub fn screen_capture(message: impl Into<String>) -> Self {

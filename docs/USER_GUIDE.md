@@ -39,7 +39,7 @@ O Nexo foi projetado sob os seguintes princípios:
 ## 💻 Instalação & Execução
 
 ### Windows
-1. Baixe o arquivo `nexo-windows-x86_64.zip` na página de [Releases](https://github.com/VicRyan007/Nexo/releases).
+1. Baixe o arquivo `nexo-<versão>-windows-x86_64.zip` na página de [Releases](https://github.com/VicRyan007/Nexo/releases).
 2. Extraia o conteúdo em uma pasta de sua preferência.
 3. Dê um duplo clique no executável `nexo.exe`.
 
@@ -87,12 +87,14 @@ O chat do Nexo suporta formatação em tempo real:
 
 ### Transferência P2P de Arquivos
 1. Clique no botão **`+`** ao lado da barra de mensagens.
-2. O arquivo será fragmentado em pedaços de 64 KB com hashes SHA-256 e transmitido diretamente aos pares conectados via protocolo `/nexo/file-transfer/0.1.0`.
+2. Escolha um arquivo no seletor nativo. O limite atual é 256 MB.
+3. O arquivo será assinado, fragmentado em pedaços de 64 KB com hashes SHA-256 e transmitido diretamente aos membros autorizados conectados via protocolo `/nexo/file-transfer/0.1.0`.
+4. Downloads aceitos são gravados automaticamente na pasta `downloads` do perfil local do Nexo após a verificação do hash final.
 
 ### Notas de Voz Rápidas
 1. Clique no botão **`Voz`** ao lado do campo de mensagem.
-2. O status mudará para **`Gravando`**. Fale sua mensagem.
-3. Clique novamente para concluir e enviar o áudio instantaneamente ao canal.
+2. O Nexo captura o microfone selecionado em PCM mono de 48 kHz por até 60 segundos.
+3. Clique novamente para concluir. A nota é salva como WAV e enviada aos membros autorizados pelo mesmo transporte P2P de arquivos.
 
 ---
 
@@ -102,10 +104,10 @@ O chat do Nexo suporta formatação em tempo real:
 1. Selecione a comunidade desejada.
 2. No painel de voz, clique em **Entrar na voz**.
 3. O status mudará para **CONECTADO** em verde esmeralda.
-4. O áudio utiliza o codec **Opus** em 48 kHz com cancelamento de eco (AEC) e supressão de ruído inteligente.
+4. O áudio utiliza o codec **Opus** em 48 kHz. A captura aplica supressão de ruído e AEC/NLMS quando existe referência de playback; a implementação atual usa o último frame enviado ao dispositivo de saída.
 
 ### Ligar/Desligar Câmera e Compartilhar Tela
-- **Câmera**: Clique em **Cam ON / Cam OFF** para transmitir sua webcam em tempo real (VP8).
+- **Câmera**: Clique em **Cam ON / Cam OFF** para transmitir sua webcam em tempo real (VP8 por padrão; H.264 acelerado fica disponível quando a conexão negocia esse codec).
 - **Compartilhar Tela**: Clique em **Comp. Tela / Parar Tela** para transmitir sua área de trabalho com baixa latência.
 - O vídeo do participante remoto e sua prévia local aparecem automaticamente no topo do painel principal.
 
@@ -115,10 +117,10 @@ Nos seletores **MICROFONE**, **ALTO-FALANTE** e **CAMERA**, você pode alternar 
 ---
 
 ## 🛡️ Segurança e Criptografia
-- **Mensagens de Comunidade**: Assinadas por Ed25519 com verificação de autorização de membro.
-- **Mensagens Diretas 1-a-1**: Criptografadas com o protocolo **Double Ratchet**, garantindo sigilo futuro perfeito (*Perfect Forward Secrecy*).
-- **Grupos MLS**: Conformidade com a especificação **RFC 9420 (TreeKEM)** para derivação assimétrica de chaves de grupo em $O(\log N)$.
-- **Fluxos de Mídia**: Pacotes de voz e vídeo protegidos por cifra autenticada (`MediaFrameCipher`).
+- **Mensagens de Comunidade**: Assinadas por Ed25519 e cifradas no envelope com ChaCha20-Poly1305 usando o segredo/epoch da comunidade. Convites antigos continuam compatíveis, mas não têm o segredo privado de grupo e usam o modo legado.
+- **Mensagens Diretas 1-a-1**: Em uma comunidade, use a seção `MENSAGENS DIRETAS` na barra lateral, selecione um membro autorizado e envie pelo compositor. A entrega ao vivo e a sincronização após reconexão preservam o envelope cifrado e o histórico local.
+- **Grupos inspirados em MLS**: commits assinados de entrada e remoção, epochs e histórico de segredos são persistidos e sincronizados entre os membros autorizados. O fundador pode remover um membro na seção `MEMBROS`; uma remoção gera envelopes X25519 individuais para os membros restantes e troca a chave da chamada. A interoperabilidade RFC 9420 e key packages padrão ainda não fazem parte do protocolo.
+- **Fluxos de Mídia**: O transporte WebRTC usa DTLS/SRTP e `MediaFrameCipher` adiciona autenticação e cifragem por frame acima do enlace. O relay encaminha o envelope sem decifrá-lo; cada publicador recebe uma trilha negociada própria e aparece como um quadro separado na galeria, limitada a oito quadros para preservar a resposta dos controles.
 
 ---
 
@@ -128,7 +130,39 @@ Nos seletores **MICROFONE**, **ALTO-FALANTE** e **CAMERA**, você pode alternar 
 1. Certifique-se de que ambos os computadores estão conectados na mesma sub-rede Wi-Fi/Ethernet.
 2. Verifique se o Firewall do Windows ou `iptables/ufw` no Linux permite tráfego multicast UDP (porta 5353 para mDNS) e portas UDP efêmeras para WebRTC.
 3. Confirme se ambos utilizaram convites válidos gerados pela mesma comunidade.
+4. A descoberta repete tentativas automaticamente por alguns segundos; se a rede bloqueia multicast, cole o endereço completo do convite ou reinicie a conexão depois de liberar o firewall.
 
 ### Áudio com eco ou ruído de fundo
 1. O pipeline de DSP do Nexo inclui cancelador de eco acústico adaptativo (AEC) e filtro de ruído RMS.
 2. Recomendamos o uso de fones de ouvido para máxima clareza sonora.
+
+### O aplicativo fecha ao entrar em voz ou vídeo
+1. Abra novamente o Nexo e repita a ação para confirmar o problema.
+2. Consulte `crash.log` dentro da pasta local de dados do Nexo e guarde o trecho iniciado por `===`.
+3. Verifique se o microfone, alto-falante, câmera e monitor continuam disponíveis; o Nexo tenta se recuperar de desconexões, mas o registro ajuda a identificar falhas do driver.
+4. Se a chamada permanecer em negociação, observe o status da chamada: mensagens com `ICE/DTLS falhou` indicam NAT/firewall ou servidores STUN/TURN, enquanto uma falha de dispositivo aparece como erro de áudio/vídeo.
+
+### Chamada entre redes diferentes (opcional)
+O Nexo continua funcionando sem internet e sem servidor externo na LAN. Para habilitar candidatos
+STUN, defina `NEXO_STUN_SERVERS` com URLs separadas por vírgula, por exemplo
+`stun:stun.example.org:3478`. Para TURN, use entradas separadas por ponto e vírgula no formato
+`turn:relay.example.org:3478|usuario|senha`. Entradas incompletas são ignoradas e não impedem o
+aplicativo de iniciar. Para descoberta opcional de peers fora da LAN, defina `NEXO_KAD_BOOTSTRAP`
+com endereços completos e autenticados terminados em `/p2p/<PeerId>`, separados por ponto e
+vírgula. Para atravessar NAT também defina `NEXO_RELAY_SERVERS` com endereços autenticados de
+Circuit Relay v2, no mesmo formato e separados por ponto e vírgula. O Nexo reserva o relay,
+anuncia um endereço `/p2p-circuit` e tenta migrar para uma conexão direta com DCUtR. Sem
+`NEXO_RELAY_SERVERS`, o modo local e as conexões diretas permanecem inalterados.
+
+Uma instalação pode hospedar um relay v2 para os demais nós. Inicie-a com
+`NEXO_RELAY_SERVER=1` e, opcionalmente, `NEXO_RELAY_LISTEN_PORT=4001`; encaminhe a porta TCP e
+UDP no roteador. Para uso fora da LAN, defina também
+`NEXO_RELAY_PUBLIC_ADDRESS=/ip4/endereco-publico/tcp/4001` e use o endereço autenticado exibido
+pela instalação como entrada de `NEXO_RELAY_SERVERS`. O recurso é desligado por padrão e possui
+limites internos para não transformar uma máquina comum em relay ilimitado.
+
+Interfaces Tailscale e ZeroTier também podem aparecer nos convites; interfaces virtuais de
+containers e adaptadores de teste continuam sendo filtradas para evitar endereços inutilizáveis.
+Para testar exclusivamente o caminho por convite ou relay, defina `NEXO_DISABLE_MDNS=1` antes de
+abrir o Nexo; isso desliga apenas a descoberta automática mDNS e não desativa conexões diretas,
+Circuit Relay ou o restante da rede.

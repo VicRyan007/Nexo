@@ -28,6 +28,12 @@ pub use session::{
     CallCommand, CallEvent, CallSession, CallState, CallTopologyMode, MediaError, ParticipantState,
 };
 pub use tones::{AudioToneKind, generate_tone};
-pub use transport::{LanPeerConnection, PeerConnectionError, ReceivedAudioPacket};
+pub use transport::{
+    DATA_CHANNEL_MESSAGE_BYTES, LanPeerConnection, PeerConnectionError, ReceivedAudioPacket,
+    ReceivedDataMessage,
+};
 pub use video::{EncodedVideoFrame, ReceivedVideoPacket, VideoCodec};
-pub use video_codec::{DecodedVideoFrame, VideoCodecError, Vp8Decoder, Vp8Encoder, i420_to_rgba};
+pub use video_codec::{
+    DecodedVideoFrame, H264Decoder, VideoCodecError, VideoDecoder, Vp8Decoder, Vp8Encoder,
+    i420_to_nv12, i420_to_rgba,
+};

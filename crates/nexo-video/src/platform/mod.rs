@@ -32,13 +32,19 @@ pub(crate) use linux::CaptureSource;
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub(crate) use other::CaptureSource;
 
+#[cfg(target_os = "windows")]
+pub(crate) use windows::HardwareH264Encoder;
 /// Cross-platform screen capture source; each backend implements the same surface.
 #[cfg(target_os = "windows")]
 pub(crate) use windows::ScreenCapture;
 
 #[cfg(target_os = "linux")]
+pub(crate) use linux::HardwareH264Encoder;
+#[cfg(target_os = "linux")]
 pub(crate) use linux::ScreenCapture;
 
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+pub(crate) use other::HardwareH264Encoder;
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub(crate) use other::ScreenCapture;
 

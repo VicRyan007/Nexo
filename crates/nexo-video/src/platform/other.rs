@@ -35,6 +35,37 @@ pub(super) fn enumerate_monitors() -> Result<Vec<MonitorInfo>, VideoError> {
 /// Placeholder screen capture source for unsupported targets.
 pub(crate) struct ScreenCapture;
 
+/// No native hardware encoder is available on this target.
+pub(crate) struct HardwareH264Encoder;
+
+pub(crate) struct NativeEncodedH264Frame {
+    pub(crate) timestamp: std::time::Duration,
+    pub(crate) data: Box<[u8]>,
+    pub(crate) is_keyframe: bool,
+}
+
+impl HardwareH264Encoder {
+    pub(crate) fn new(_width: u32, _height: u32, _bitrate_bps: u32) -> Result<Self, VideoError> {
+        Err(VideoError::unsupported(std::env::consts::OS))
+    }
+
+    pub(crate) fn width(&self) -> u32 {
+        0
+    }
+
+    pub(crate) fn height(&self) -> u32 {
+        0
+    }
+
+    pub(crate) fn encode(
+        &mut self,
+        _timestamp: std::time::Duration,
+        _nv12: &[u8],
+    ) -> Result<Option<NativeEncodedH264Frame>, VideoError> {
+        Err(VideoError::unsupported(std::env::consts::OS))
+    }
+}
+
 impl ScreenCapture {
     pub(crate) fn open_monitor(_monitor_id: &str) -> Result<Self, VideoError> {
         Err(VideoError::screen_capture(std::env::consts::OS))

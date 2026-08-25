@@ -1,9 +1,8 @@
 //! Camera frame capture.
 //!
 //! [`VideoCaptureSource`] opens a camera (by the id from
-//! [`crate::enumerate_cameras`]) and pulls decoded frames one at a time. It is
-//! synchronous and non-buffering: every `read_frame` call returns at most one
-//! frame, so callers that need pacing (e.g. a 20 ms video clock) own the thread.
+//! [`crate::enumerate_cameras`]) and exposes the newest decoded frame without
+//! blocking the caller. The platform reader runs on a dedicated worker.
 //!
 //! The concrete source reader lives in [`crate::platform`]; on Windows it is
 //! backed by `IMFSourceReader` with an NV12-negotiated media type and native
@@ -12,6 +11,7 @@
 use std::time::Duration;
 
 use crate::devices::VideoError;
+use crate::frame_worker::FrameWorker;
 use crate::platform::CaptureSource;
 
 /// Pixel layout of the frame bytes delivered by a capture source.
@@ -50,7 +50,8 @@ impl VideoFrame {
 
 /// A live handle to a camera capture stream.
 pub struct VideoCaptureSource {
-    source: CaptureSource,
+    resolution: (u32, u32),
+    worker: FrameWorker,
 }
 
 impl VideoCaptureSource {
@@ -66,23 +67,28 @@ impl VideoCaptureSource {
         width: u32,
         height: u32,
     ) -> Result<Self, VideoError> {
-        Ok(Self {
-            source: CaptureSource::open(device_id, width, height)?,
-        })
+        let device_id = device_id.to_owned();
+        let (worker, resolution) = FrameWorker::spawn_open(
+            move || CaptureSource::open(&device_id, width, height),
+            CaptureSource::resolution,
+            CaptureSource::read_frame,
+        )?;
+        Ok(Self { resolution, worker })
     }
 
     /// The resolution actually negotiated with the device.
     #[must_use]
     pub fn resolution(&self) -> (u32, u32) {
-        self.source.resolution()
+        self.resolution
     }
 
-    /// Pull the next frame, blocking until one is ready.
+    /// Pull the newest frame without blocking the caller.
     ///
-    /// Returns `Ok(None)` once the stream ends. Repeated calls hand out one
-    /// frame each and never buffer more than a single sample internally.
+    /// Returns `Ok(None)` when the capture thread has not produced a newer
+    /// frame yet. The capture thread owns the platform reader and can block
+    /// independently while waiting for the next sample.
     pub fn read_frame(&mut self) -> Result<Option<VideoFrame>, VideoError> {
-        self.source.read_frame()
+        self.worker.take_latest().transpose()
     }
 }
 

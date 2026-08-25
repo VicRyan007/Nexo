@@ -19,6 +19,32 @@ export struct ParticipantRow {
     connected: bool,
 }
 
+export struct ChannelRow {
+    id: string,
+    name: string,
+    kind: string,
+    selected: bool,
+}
+
+export struct DirectPeerRow {
+    id: string,
+    label: string,
+    selected: bool,
+}
+
+export struct MemberRow {
+    id: string,
+    label: string,
+    can_remove: bool,
+    is_self: bool,
+}
+
+export struct RemoteVideoRow {
+    peer_id: string,
+    label: string,
+    frame: image,
+}
+
 export component AppWindow inherits Window {
     title: "Nexo";
     icon: @image-url("assets/nexo.png");
@@ -32,13 +58,14 @@ export component AppWindow inherits Window {
     in-out property <string> peer-id: "Inicializando identidade";
     in-out property <string> invite-code: "";
     in-out property <string> active-community: "";
+    in-out property <string> active-channel: "";
     in-out property <bool> has-community: false;
     in-out property <bool> call-active: false;
+    in-out property <bool> call-starting: false;
     in-out property <bool> call-muted: false;
     in-out property <bool> video-enabled: true;
     in-out property <bool> screen-sharing: false;
     in-out property <image> local-video;
-    in-out property <image> remote-video;
     in-out property <bool> has-local-video: false;
     in-out property <bool> has-remote-video: false;
     in-out property <string> call-status: "Fora da voz";
@@ -49,14 +76,26 @@ export component AppWindow inherits Window {
     in-out property <string> selected-output-device: "";
     in-out property <string> selected-video-device: "";
     in-out property <[ParticipantRow]> participants: [];
+    in-out property <[RemoteVideoRow]> remote-videos: [];
     in-out property <[CommunityRow]> communities: [];
+    in-out property <[ChannelRow]> channels: [];
+    in-out property <[DirectPeerRow]> direct-peers: [];
+    in-out property <[MemberRow]> members: [];
+    in-out property <bool> can-manage-members: false;
+    in-out property <string> active-direct-peer: "";
+    in-out property <[MessageRow]> direct-messages: [];
     in-out property <[MessageRow]> messages: [];
     in-out property <bool> is-recording-voice: false;
 
     callback create-network(string);
     callback join-network(string);
     callback select-community(string);
+    callback select-channel(string);
+    callback select-direct-peer(string);
+    callback revoke-member(string);
+    callback create-channel(string, string);
     callback send-message(string) -> bool;
+    callback send-direct-message(string) -> bool;
     callback attach-file();
     callback toggle-voice-recording();
     callback join-call();
@@ -102,7 +141,11 @@ export component AppWindow inherits Window {
                         horizontal-alignment: center;
                         vertical-alignment: center;
                     }
-                    TouchArea { clicked => { root.select-community(community.id); } }
+                    TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => { root.select-community(community.id); }
+                    }
                 }
                 Rectangle { vertical-stretch: 1; }
                 Rectangle {
@@ -122,17 +165,124 @@ export component AppWindow inherits Window {
         Rectangle {
             width: 260px;
             background: #1b2227;
-            VerticalBox {
-                padding: 18px;
-                spacing: 12px;
+            ScrollView {
+                vertical-stretch: 1;
+                VerticalBox {
+                    padding: 18px;
+                    spacing: 12px;
                 Text { text: "NEXO"; color: #f0f5f7; font-size: 18px; font-weight: 800; }
                 Text { text: root.active-community == "" ? "COMUNIDADES" : root.active-community; color: #82929a; font-size: 11px; }
 
-                if root.has-community : Rectangle {
-                    height: 42px;
-                    border-radius: 6px;
-                    background: #263138;
-                    Text { x: 12px; text: "#  geral"; color: #e3ecef; vertical-alignment: center; }
+                if root.has-community : VerticalBox {
+                    spacing: 4px;
+                    HorizontalBox {
+                        height: 24px;
+                        Text { text: "CANAIS"; color: #82929a; font-size: 10px; vertical-alignment: center; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Button {
+                            text: "+";
+                            width: 24px;
+                            height: 24px;
+                            clicked => {
+                                if channel-name.text != "" {
+                                    root.create-channel(channel-name.text, "text");
+                                    channel-name.text = "";
+                                }
+                            }
+                        }
+                    }
+                    for channel in root.channels : Rectangle {
+                        height: 32px;
+                        border-radius: 6px;
+                        background: channel.selected ? #2f414a : #20292e;
+                        Text {
+                            x: 10px;
+                            text: channel.kind == "voice" ? "V  " + channel.name : "#  " + channel.name;
+                            color: channel.selected ? #f2f7f8 : #bdc9cd;
+                            vertical-alignment: center;
+                        }
+                        TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            clicked => { root.select-channel(channel.id); }
+                        }
+                    }
+                    Text { text: "MENSAGENS DIRETAS"; color: #82929a; font-size: 10px; vertical-alignment: center; }
+                    if root.direct-peers.length == 0 : Text {
+                        text: "Nenhum membro disponível";
+                        color: #64737a;
+                        font-size: 11px;
+                    }
+                    for direct-peer in root.direct-peers : Rectangle {
+                        height: 32px;
+                        border-radius: 6px;
+                        background: direct-peer.selected ? #2f414a : #20292e;
+                        Text {
+                            x: 10px;
+                            text: "@  " + direct-peer.label;
+                            color: direct-peer.selected ? #f2f7f8 : #bdc9cd;
+                            vertical-alignment: center;
+                        }
+                        TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            clicked => { root.select-direct-peer(direct-peer.id); }
+                        }
+                    }
+                    Text { text: "MEMBROS"; color: #82929a; font-size: 10px; vertical-alignment: center; }
+                    for member in root.members : Rectangle {
+                        height: member.can-remove ? 34px : 24px;
+                        border-radius: 5px;
+                        background: #20292e;
+                        HorizontalBox {
+                            padding-left: 8px;
+                            padding-right: 4px;
+                            spacing: 4px;
+                            Text {
+                                text: member.label;
+                                color: member.is-self ? #5fe0a2 : #bdc9cd;
+                                font-size: 10px;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                            if member.can-remove : Button {
+                                width: 58px;
+                                height: 24px;
+                                text: "Remover";
+                                clicked => { root.revoke-member(member.id); }
+                            }
+                        }
+                    }
+                    channel-name := LineEdit {
+                        height: 28px;
+                        placeholder-text: "Novo canal";
+                    }
+                    HorizontalBox {
+                        spacing: 4px;
+                        Button {
+                            horizontal-stretch: 1;
+                            height: 28px;
+                            text: "Texto";
+                            clicked => {
+                                if channel-name.text != "" {
+                                    root.create-channel(channel-name.text, "text");
+                                    channel-name.text = "";
+                                }
+                            }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            height: 28px;
+                            text: "Voz";
+                            clicked => {
+                                if channel-name.text != "" {
+                                    root.create-channel(channel-name.text, "voice");
+                                    channel-name.text = "";
+                                }
+                            }
+                        }
+                    }
                 }
 
                 if root.has-community : Rectangle {
@@ -144,7 +294,7 @@ export component AppWindow inherits Window {
                         spacing: 5px;
                         HorizontalBox {
                             Text {
-                                text: "Voz  geral";
+                                text: "Voz  " + root.active-channel;
                                 color: #e3ecef;
                                 font-size: 12px;
                                 vertical-alignment: center;
@@ -158,7 +308,9 @@ export component AppWindow inherits Window {
                             }
                         }
                         if !root.call-active : Button {
-                            text: "Entrar na voz";
+                            height: 34px;
+                            text: root.call-starting ? "Conectando..." : "Entrar na voz";
+                            enabled: !root.call-starting;
                             clicked => { root.join-call(); }
                         }
                         if root.call-active : VerticalBox {
@@ -167,10 +319,14 @@ export component AppWindow inherits Window {
                             HorizontalBox {
                                 spacing: 4px;
                                 Button {
+                                    horizontal-stretch: 1;
+                                    height: 34px;
                                     text: root.call-muted ? "Desmutar" : "Silenciar";
                                     clicked => { root.set-muted(!root.call-muted); }
                                 }
                                 Button {
+                                    horizontal-stretch: 1;
+                                    height: 34px;
                                     text: root.video-enabled ? "Cam OFF" : "Cam ON";
                                     clicked => { root.toggle-video(); }
                                 }
@@ -178,10 +334,14 @@ export component AppWindow inherits Window {
                             HorizontalBox {
                                 spacing: 4px;
                                 Button {
+                                    horizontal-stretch: 1;
+                                    height: 34px;
                                     text: root.screen-sharing ? "Parar Tela" : "Comp. Tela";
                                     clicked => { root.toggle-screen-share(); }
                                 }
                                 Button {
+                                    horizontal-stretch: 1;
+                                    height: 34px;
                                     text: "Sair";
                                     clicked => { root.leave-call(); }
                                 }
@@ -250,10 +410,11 @@ export component AppWindow inherits Window {
                     wrap: word-wrap;
                 }
 
-                Rectangle { vertical-stretch: 1; }
+                Rectangle { height: 8px; }
                 Text { text: "CRIAR COMUNIDADE"; color: #7f9099; font-size: 10px; }
                 network-name := LineEdit { placeholder-text: "Nome"; }
                 Button {
+                    height: 34px;
                     text: "Criar e gerar convite";
                     enabled: network-name.text != "";
                     clicked => { root.create-network(network-name.text); network-name.text = ""; }
@@ -270,12 +431,14 @@ export component AppWindow inherits Window {
                 Text { text: "ENTRAR COM CONVITE"; color: #7f9099; font-size: 10px; }
                 invite := LineEdit { placeholder-text: "NEXO1..."; }
                 Button {
+                    height: 34px;
                     text: "Entrar";
                     enabled: invite.text != "";
                     clicked => { root.join-network(invite.text); }
                 }
                 Rectangle { height: 1px; background: #303a40; }
                 Text { text: root.peer-id; color: #839198; font-size: 10px; wrap: word-wrap; }
+                }
             }
         }
 
@@ -291,7 +454,7 @@ export component AppWindow inherits Window {
                         padding-right: 22px;
                         spacing: 12px;
                         Text {
-                            text: root.has-community ? "# geral" : "Inicio";
+                            text: root.active-direct-peer != "" ? "Mensagem direta" : (root.has-community ? "# geral" : "Inicio");
                             color: #eef4f5;
                             font-size: 17px;
                             font-weight: 650;
@@ -308,26 +471,32 @@ export component AppWindow inherits Window {
                     padding: 22px;
                     spacing: 12px;
 
-                    if root.call-active && (root.has-remote-video || root.has-local-video) : HorizontalBox {
+                    if root.active-direct-peer == "" && root.call-active && (root.has-remote-video || root.has-local-video) : HorizontalBox {
                         height: 200px;
                         spacing: 12px;
-                        if root.has-remote-video : Rectangle {
+                        if root.has-remote-video : ScrollView {
                             horizontal-stretch: 1;
-                            background: #0d1215;
-                            border-radius: 8px;
-                            clip: true;
-                            Image {
-                                width: 100%;
-                                height: 100%;
-                                image-fit: contain;
-                                source: root.remote-video;
-                            }
-                            Text {
-                                x: 10px;
-                                y: 10px;
-                                text: "Participante Remoto";
-                                color: #82929a;
-                                font-size: 10px;
+                            HorizontalBox {
+                                spacing: 8px;
+                                for remote in root.remote-videos : Rectangle {
+                                    width: 220px;
+                                    background: #0d1215;
+                                    border-radius: 8px;
+                                    clip: true;
+                                    Image {
+                                        width: 100%;
+                                        height: 100%;
+                                        image-fit: contain;
+                                        source: remote.frame;
+                                    }
+                                    Text {
+                                        x: 10px;
+                                        y: 10px;
+                                        text: remote.label;
+                                        color: #82929a;
+                                        font-size: 10px;
+                                    }
+                                }
                             }
                         }
                         if root.has-local-video : Rectangle {
@@ -353,7 +522,32 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    ScrollView {
+                    if root.active-direct-peer != "" : ScrollView {
+                        vertical-stretch: 1;
+                        VerticalBox {
+                            spacing: 12px;
+                            if root.direct-messages.length == 0 : Text {
+                                text: "Nenhuma mensagem direta ainda.";
+                                color: #7f9099;
+                                font-size: 13px;
+                            }
+                            for message in root.direct-messages : Rectangle {
+                                height: 64px;
+                                background: message.mine ? #17251f : #151c20;
+                                border-radius: 6px;
+                                VerticalBox {
+                                    padding: 9px;
+                                    spacing: 3px;
+                                    HorizontalBox {
+                                        Text { text: message.author; color: message.mine ? #5fe0a2 : #80bfff; font-size: 12px; font-weight: 650; }
+                                        Text { text: message.time; color: #65747b; font-size: 10px; }
+                                    }
+                                    Text { text: message.body; color: #d7e0e3; font-size: 13px; wrap: word-wrap; }
+                                }
+                            }
+                        }
+                    }
+                    if root.active-direct-peer == "" : ScrollView {
                         vertical-stretch: 1;
                         VerticalBox {
                             spacing: 12px;
@@ -383,20 +577,23 @@ export component AppWindow inherits Window {
                         spacing: 8px;
                         Button {
                             width: 38px;
+                            height: 34px;
                             text: "+";
                             clicked => { root.attach-file(); }
                         }
                         Button {
                             width: 70px;
+                            height: 34px;
                             text: root.is-recording-voice ? "Gravando" : "Voz";
                             clicked => { root.toggle-voice-recording(); }
                         }
-                        composer := LineEdit { horizontal-stretch: 1; placeholder-text: "Mensagem para #geral"; }
+                        composer := LineEdit { horizontal-stretch: 1; placeholder-text: root.active-direct-peer != "" ? "Mensagem direta" : "Mensagem para #geral"; }
                         Button {
+                            height: 34px;
                             text: "Enviar";
                             enabled: composer.text != "";
                             clicked => {
-                                if (root.send-message(composer.text)) {
+                                if (root.active-direct-peer != "" ? root.send-direct-message(composer.text) : root.send-message(composer.text)) {
                                     composer.text = "";
                                 }
                             }
@@ -421,4 +618,24 @@ export component AppWindow inherits Window {
             }
         }
     }
+}
+
+export component NexoTray inherits SystemTrayIcon {
+    icon: @image-url("assets/nexo.png");
+    title: "Nexo";
+    tooltip: "Nexo - Rede local";
+
+    Menu {
+        MenuItem {
+            title: "Abrir Nexo";
+            activated => { root.show-window(); }
+        }
+        MenuItem {
+            title: "Sair";
+            activated => { root.quit-app(); }
+        }
+    }
+
+    callback show-window();
+    callback quit-app();
 }

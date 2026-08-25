@@ -21,13 +21,15 @@ anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"
+chacha20poly1305 = "0.10"
 chrono = "0.4"
 cpal = "0.18.1"
 dirs = "6"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 futures = "0.3"
 if-addrs = "0.15"
-libp2p = { version = "0.56", features = ["cbor", "identify", "macros", "mdns", "noise", "ping", "quic", "request-response", "tcp", "tokio", "yamux"] }
+libp2p = { version = "0.56", features = ["cbor", "dcutr", "identify", "kad", "macros", "mdns", "noise", "ping", "quic", "relay", "request-response", "tcp", "tokio", "yamux"] }
+openh264 = "0.9.8"
 rand = "0.8"
 rusqlite = { version = "0.37", features = ["bundled"] }
 rtc = "=0.21.0-alpha.1"
@@ -40,6 +42,7 @@ slint-build = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1", features = ["serde", "v4", "v5"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 webrtc = "0.21.0-alpha.1"
 zeroize = "1"
 

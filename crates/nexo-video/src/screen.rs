@@ -1,10 +1,8 @@
 //! Screen capture.
 //!
 //! [`ScreenCaptureSource`] opens a monitor (by the id from
-//! [`enumerate_monitors`]) and pulls frames one at a time. Like camera capture,
-//! it is synchronous and non-buffering: every `read_frame` call returns at most
-//! one frame, so callers that need pacing (e.g. a 20 ms video clock) own the
-//! thread.
+//! [`enumerate_monitors`]) and exposes the newest frame without blocking the
+//! caller. The platform reader runs on a dedicated worker.
 //!
 //! The concrete source reader lives in [`crate::platform`]; on Windows it is
 //! backed by Windows Graphics Capture with a `Direct3D11` staging copy, producing
@@ -12,6 +10,7 @@
 
 use crate::capture::VideoFrame;
 use crate::devices::VideoError;
+use crate::frame_worker::FrameWorker;
 use crate::platform::ScreenCapture;
 
 /// A single monitor available on this machine.
@@ -38,28 +37,34 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>, VideoError> {
 
 /// A live handle to a screen capture stream of one monitor.
 pub struct ScreenCaptureSource {
-    source: ScreenCapture,
+    resolution: (u32, u32),
+    worker: FrameWorker,
 }
 
 impl ScreenCaptureSource {
     /// Open `monitor_id` for capture.
     pub fn open_monitor(monitor_id: &str) -> Result<Self, VideoError> {
-        Ok(Self {
-            source: ScreenCapture::open_monitor(monitor_id)?,
-        })
+        let monitor_id = monitor_id.to_owned();
+        let (worker, resolution) = FrameWorker::spawn_open(
+            move || ScreenCapture::open_monitor(&monitor_id),
+            ScreenCapture::resolution,
+            ScreenCapture::read_frame,
+        )?;
+        Ok(Self { resolution, worker })
     }
 
     /// The resolution actually delivered for the monitor.
     #[must_use]
     pub fn resolution(&self) -> (u32, u32) {
-        self.source.resolution()
+        self.resolution
     }
 
-    /// Pull the next frame, blocking until one is ready.
+    /// Pull the newest frame without blocking the caller.
     ///
-    /// Returns `Ok(None)` once the stream ends. Repeated calls hand out one
-    /// frame each and never buffer more than a single sample internally.
+    /// Returns `Ok(None)` when the capture thread has not produced a newer
+    /// frame yet. The capture thread owns the platform reader and can block
+    /// independently while waiting for the next sample.
     pub fn read_frame(&mut self) -> Result<Option<VideoFrame>, VideoError> {
-        self.source.read_frame()
+        self.worker.take_latest().transpose()
     }
 }

@@ -1,26 +1,37 @@
 # Windows packaging script for Nexo
 param(
     [string]$Version = "1.0.0",
-    [string]$OutDir = "dist"
+    [string]$OutDir = "dist",
+    [string]$Toolchain = ""
 )
 
 $ErrorActionPreference = "Stop"
+$Version = $Version.TrimStart('v')
+if ([string]::IsNullOrWhiteSpace($Version)) { throw "Version must not be empty" }
 
 Write-Host "==> Building Nexo release binary for Windows x86_64..."
-$mingw = 'C:\Users\Ryan\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin'
-if (Test-Path $mingw) {
-    $env:PATH = "$mingw;$env:USERPROFILE\.cargo\bin;$env:PATH"
-    cargo +1.97.1-x86_64-pc-windows-gnu build --release -p nexo-app
+$ToolchainArgs = @()
+if ($Toolchain) {
+    $ToolchainArgs = @("+$Toolchain")
+}
+& cargo @ToolchainArgs build --release -p nexo-app
+if ($LASTEXITCODE -ne 0) { throw "Release build failed" }
+
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$DistPath = if ([System.IO.Path]::IsPathRooted($OutDir)) {
+    $OutDir
 } else {
-    cargo build --release -p nexo-app
+    Join-Path $RepoRoot $OutDir
 }
+New-Item -ItemType Directory -Path $DistPath -Force | Out-Null
+$DistPath = (Resolve-Path -LiteralPath $DistPath).Path
 
-$DistPath = Join-Path $PSScriptRoot "..\$OutDir"
-if (!(Test-Path $DistPath)) {
-    New-Item -ItemType Directory -Path $DistPath -Force | Out-Null
+$targetRoot = if ($env:CARGO_TARGET_DIR) {
+    $env:CARGO_TARGET_DIR
+} else {
+    Join-Path $PSScriptRoot "..\target"
 }
-
-$BinaryPath = Join-Path $PSScriptRoot "..\target\release\nexo.exe"
+$BinaryPath = Join-Path $targetRoot "release\nexo.exe"
 if (!(Test-Path $BinaryPath)) {
     throw "Build failed: binary not found at $BinaryPath"
 }
@@ -35,6 +46,7 @@ New-Item -ItemType Directory -Path $TempStage -Force | Out-Null
 
 Copy-Item $BinaryPath -Destination (Join-Path $TempStage "nexo.exe")
 Copy-Item (Join-Path $PSScriptRoot "..\README.md") -Destination (Join-Path $TempStage "README.md")
+Copy-Item (Join-Path $PSScriptRoot "..\LICENSE") -Destination (Join-Path $TempStage "LICENSE")
 
 if (Test-Path $ZipPath) { Remove-Item -Force $ZipPath }
 $ItemsToZip = (Get-ChildItem -Path $TempStage).FullName

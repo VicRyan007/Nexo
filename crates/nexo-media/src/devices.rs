@@ -1,4 +1,4 @@
-﻿use std::sync::{
+use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU32, Ordering},
     mpsc::{Receiver, SyncSender, TryRecvError, sync_channel},
@@ -53,6 +53,7 @@ pub struct InputFrameSource {
 pub struct OutputPlayback {
     _stream: Stream,
     queue: Arc<Mutex<PcmPlaybackBuffer>>,
+    reference: Arc<Mutex<Option<Vec<f32>>>>,
     sample_rate: u32,
     failed: Arc<AtomicBool>,
 }
@@ -82,6 +83,7 @@ impl OutputPlayback {
         let sample_rate = supported.sample_rate();
         let config = supported.config();
         let queue = Arc::new(Mutex::new(PcmPlaybackBuffer::new()));
+        let reference = Arc::new(Mutex::new(None));
         let failed = Arc::new(AtomicBool::new(false));
         let stream = match supported.sample_format() {
             SampleFormat::I8 => {
@@ -127,6 +129,7 @@ impl OutputPlayback {
         Ok(Self {
             _stream: stream,
             queue,
+            reference,
             sample_rate,
             failed,
         })
@@ -147,7 +150,22 @@ impl OutputPlayback {
             .lock()
             .map_err(|_| MediaError::AudioDevice("audio playback queue is poisoned".to_owned()))?
             .push_resampled(&frame.samples, frame.sample_rate, self.sample_rate);
+        self.reference
+            .lock()
+            .map_err(|_| MediaError::AudioDevice("audio reference queue is poisoned".to_owned()))?
+            .replace(frame.samples.clone());
         Ok(())
+    }
+
+    /// Returns the most recently submitted mono playback frame for acoustic
+    /// echo cancellation. The output callback remains independent of this
+    /// best-effort reference snapshot.
+    #[must_use]
+    pub fn latest_reference(&self) -> Option<Vec<f32>> {
+        self.reference
+            .lock()
+            .ok()
+            .and_then(|reference| reference.clone())
     }
 
     #[must_use]
@@ -263,49 +281,49 @@ impl InputFrameSource {
         let supported = device
             .default_input_config()
             .map_err(|error| MediaError::AudioDevice(error.to_string()))?;
-        if supported.sample_rate() != OPUS_SAMPLE_RATE {
-            return Err(MediaError::AudioDevice(format!(
-                "input uses {} Hz; 48000 Hz resampling is not available yet",
-                supported.sample_rate()
-            )));
-        }
         let channels = usize::from(supported.channels());
+        let sample_rate = supported.sample_rate();
         let config = supported.config();
         let (sender, receiver) = sync_channel(8);
         let failed = Arc::new(AtomicBool::new(false));
         let stream = match supported.sample_format() {
             SampleFormat::I8 => {
-                build_frame_stream::<i8>(device, &config, channels, sender, &failed)
+                build_frame_stream::<i8>(device, &config, channels, sample_rate, sender, &failed)
             }
             SampleFormat::I16 => {
-                build_frame_stream::<i16>(device, &config, channels, sender, &failed)
+                build_frame_stream::<i16>(device, &config, channels, sample_rate, sender, &failed)
             }
-            SampleFormat::I24 => {
-                build_frame_stream::<cpal::I24>(device, &config, channels, sender, &failed)
-            }
+            SampleFormat::I24 => build_frame_stream::<cpal::I24>(
+                device,
+                &config,
+                channels,
+                sample_rate,
+                sender,
+                &failed,
+            ),
             SampleFormat::I32 => {
-                build_frame_stream::<i32>(device, &config, channels, sender, &failed)
+                build_frame_stream::<i32>(device, &config, channels, sample_rate, sender, &failed)
             }
             SampleFormat::I64 => {
-                build_frame_stream::<i64>(device, &config, channels, sender, &failed)
+                build_frame_stream::<i64>(device, &config, channels, sample_rate, sender, &failed)
             }
             SampleFormat::U8 => {
-                build_frame_stream::<u8>(device, &config, channels, sender, &failed)
+                build_frame_stream::<u8>(device, &config, channels, sample_rate, sender, &failed)
             }
             SampleFormat::U16 => {
-                build_frame_stream::<u16>(device, &config, channels, sender, &failed)
+                build_frame_stream::<u16>(device, &config, channels, sample_rate, sender, &failed)
             }
             SampleFormat::U32 => {
-                build_frame_stream::<u32>(device, &config, channels, sender, &failed)
+                build_frame_stream::<u32>(device, &config, channels, sample_rate, sender, &failed)
             }
             SampleFormat::U64 => {
-                build_frame_stream::<u64>(device, &config, channels, sender, &failed)
+                build_frame_stream::<u64>(device, &config, channels, sample_rate, sender, &failed)
             }
             SampleFormat::F32 => {
-                build_frame_stream::<f32>(device, &config, channels, sender, &failed)
+                build_frame_stream::<f32>(device, &config, channels, sample_rate, sender, &failed)
             }
             SampleFormat::F64 => {
-                build_frame_stream::<f64>(device, &config, channels, sender, &failed)
+                build_frame_stream::<f64>(device, &config, channels, sample_rate, sender, &failed)
             }
             format => Err(MediaError::AudioDevice(format!(
                 "unsupported input sample format {format}"
@@ -346,6 +364,7 @@ fn build_frame_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     channels: usize,
+    sample_rate: u32,
     sender: SyncSender<AudioFrame>,
     failed: &Arc<AtomicBool>,
 ) -> Result<Stream, MediaError>
@@ -353,7 +372,7 @@ where
     T: SizedSample + Sample,
     f32: FromSample<T>,
 {
-    let mut framer = PcmFramer::new(channels);
+    let mut framer = PcmFramer::new(channels, sample_rate);
     let failed = Arc::clone(failed);
     device
         .build_input_stream(
@@ -369,33 +388,61 @@ where
 
 struct PcmFramer {
     channels: usize,
-    pending: Vec<f32>,
+    source_rate: u32,
+    source_samples: Vec<f32>,
+    source_position: f64,
+    output_samples: Vec<f32>,
 }
 
 impl PcmFramer {
-    fn new(channels: usize) -> Self {
+    fn new(channels: usize, source_rate: u32) -> Self {
         Self {
             channels: channels.max(1),
-            pending: Vec::with_capacity(OPUS_FRAME_SAMPLES * 2),
+            source_rate,
+            source_samples: Vec::with_capacity(OPUS_FRAME_SAMPLES * 2),
+            source_position: 0.0,
+            output_samples: Vec::with_capacity(OPUS_FRAME_SAMPLES * 2),
         }
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
     fn push(&mut self, samples: impl Iterator<Item = f32>, sender: &SyncSender<AudioFrame>) {
         let interleaved = samples.collect::<Vec<_>>();
         for frame in interleaved.chunks_exact(self.channels) {
             #[allow(clippy::cast_precision_loss)]
             let channel_count = self.channels as f32;
-            self.pending.push(frame.iter().sum::<f32>() / channel_count);
-            if self.pending.len() == OPUS_FRAME_SAMPLES {
-                let samples = std::mem::replace(
-                    &mut self.pending,
-                    Vec::with_capacity(OPUS_FRAME_SAMPLES * 2),
-                );
+            self.source_samples
+                .push(frame.iter().sum::<f32>() / channel_count);
+        }
+
+        if self.source_rate == 0 {
+            return;
+        }
+        let step = f64::from(self.source_rate) / f64::from(OPUS_SAMPLE_RATE);
+        while self.source_position + 1.0 < self.source_samples.len() as f64 {
+            let left_index = self.source_position.floor() as usize;
+            let fraction = (self.source_position - left_index as f64) as f32;
+            let left = self.source_samples[left_index];
+            let right = self.source_samples[left_index + 1];
+            self.output_samples.push(left + (right - left) * fraction);
+            self.source_position += step;
+            while self.output_samples.len() >= OPUS_FRAME_SAMPLES {
+                let samples = self.output_samples.drain(..OPUS_FRAME_SAMPLES).collect();
                 let _ = sender.try_send(AudioFrame {
                     samples,
                     sample_rate: OPUS_SAMPLE_RATE,
                 });
             }
+        }
+
+        let consumed = self.source_position.floor() as usize;
+        if consumed > 0 {
+            self.source_samples.drain(..consumed);
+            self.source_position -= consumed as f64;
         }
     }
 }
@@ -601,8 +648,8 @@ mod tests {
     #[test]
     fn stereo_input_is_framed_as_twenty_ms_mono() {
         let (sender, receiver) = sync_channel(1);
-        let mut framer = PcmFramer::new(2);
-        let stereo = (0..OPUS_FRAME_SAMPLES).flat_map(|_| [0.25_f32, 0.75_f32]);
+        let mut framer = PcmFramer::new(2, OPUS_SAMPLE_RATE);
+        let stereo = (0..=OPUS_FRAME_SAMPLES).flat_map(|_| [0.25_f32, 0.75_f32]);
         framer.push(stereo, &sender);
         let frame = receiver.try_recv().expect("one frame should be produced");
         assert_eq!(frame.samples.len(), OPUS_FRAME_SAMPLES);
@@ -611,6 +658,27 @@ mod tests {
                 .samples
                 .iter()
                 .all(|sample| (*sample - 0.5).abs() < f32::EPSILON)
+        );
+    }
+
+    #[test]
+    fn non_48khz_input_is_resampled_into_opus_frames() {
+        let (sender, receiver) = sync_channel(2);
+        let mut framer = PcmFramer::new(1, 44_100);
+        framer.push((0..44_100).map(|_| 0.25_f32), &sender);
+        let first = receiver.try_recv().expect("resampled frame should exist");
+        let second = receiver
+            .try_recv()
+            .expect("a second resampled frame should exist");
+        assert_eq!(first.sample_rate, OPUS_SAMPLE_RATE);
+        assert_eq!(first.samples.len(), OPUS_FRAME_SAMPLES);
+        assert_eq!(second.samples.len(), OPUS_FRAME_SAMPLES);
+        assert!(
+            first
+                .samples
+                .iter()
+                .chain(second.samples.iter())
+                .all(|sample| (*sample - 0.25).abs() < f32::EPSILON)
         );
     }
 

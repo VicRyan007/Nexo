@@ -77,6 +77,12 @@ impl CongestionController {
         self.current_profile
     }
 
+    pub(crate) fn restore_profile(&mut self, profile: VideoQualityProfile) {
+        self.current_profile = profile;
+        self.consecutive_good_reports = 0;
+        self.last_adjustment = Instant::now();
+    }
+
     /// Process updated transport metrics and compute new target quality profile.
     pub fn on_network_metrics(
         &mut self,
@@ -133,6 +139,49 @@ impl CongestionController {
 
         self.current_profile
     }
+
+    /// Select a bounded quality tier from the receiver's available bitrate.
+    ///
+    /// REMB is the only transport signal guaranteed by every supported WebRTC
+    /// backend. It is therefore used as a conservative input for the live
+    /// encoder profile; packet loss and RTT can still refine the profile through
+    /// [`Self::on_network_metrics`].
+    pub fn on_bitrate_estimate(&mut self, bitrate_bps: u32, now: Instant) -> VideoQualityProfile {
+        if now.duration_since(self.last_adjustment) < Duration::from_millis(500) {
+            return self.current_profile;
+        }
+
+        let estimate_kbps = bitrate_bps / 1_000;
+        let tier = if estimate_kbps < 500 {
+            VideoQualityProfile {
+                target_bitrate_kbps: self.min_bitrate_kbps,
+                target_fps: 15,
+                width: 640,
+                height: 360,
+            }
+        } else if estimate_kbps < 1_000 {
+            VideoQualityProfile {
+                target_bitrate_kbps: 600.max(self.min_bitrate_kbps),
+                target_fps: 24,
+                width: 854,
+                height: 480,
+            }
+        } else {
+            VideoQualityProfile {
+                target_bitrate_kbps: 1_200.min(self.max_bitrate_kbps),
+                target_fps: 30,
+                width: 1_280,
+                height: 720,
+            }
+        };
+
+        if tier != self.current_profile {
+            self.current_profile = tier;
+            self.consecutive_good_reports = 0;
+            self.last_adjustment = now;
+        }
+        self.current_profile
+    }
 }
 
 #[cfg(test)]
@@ -182,5 +231,31 @@ mod tests {
         let recovered = controller.current_profile();
         assert!(recovered.target_bitrate_kbps > profile.target_bitrate_kbps);
         assert_eq!(recovered.target_fps, 30);
+    }
+
+    #[test]
+    fn bitrate_estimate_selects_low_medium_and_high_quality_tiers() {
+        let initial = VideoQualityProfile {
+            target_bitrate_kbps: 1_500,
+            target_fps: 30,
+            width: 640,
+            height: 480,
+        };
+        let mut controller = CongestionController::new(initial, 150, 3_000);
+        let mut now = Instant::now() + Duration::from_millis(600);
+
+        let low = controller.on_bitrate_estimate(300_000, now);
+        assert_eq!((low.target_fps, low.width, low.height), (15, 640, 360));
+
+        now += Duration::from_millis(600);
+        let medium = controller.on_bitrate_estimate(800_000, now);
+        assert_eq!(
+            (medium.target_fps, medium.width, medium.height),
+            (24, 854, 480)
+        );
+
+        now += Duration::from_millis(600);
+        let high = controller.on_bitrate_estimate(2_000_000, now);
+        assert_eq!((high.target_fps, high.width, high.height), (30, 1_280, 720));
     }
 }

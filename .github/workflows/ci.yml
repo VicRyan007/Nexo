@@ -20,4 +20,67 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libfontconfig1-dev libxkbcommon-dev
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - name: Unit and integration tests (serialized binaries)
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_test() { cargo test "$@" -- --test-threads=1; }
+          run_test --workspace --lib --bins
+          run_test -p nexo-app --test two_instances
+          run_test -p nexo-app --test three_instances
+          run_test -p nexo-net --test file_transfer_loopback
+          run_test -p nexo-net --test sync_loopback
+          run_test -p nexo-net --test voice_loopback
+          run_test -p nexo-media --test video_loopback
+          run_test -p nexo-video --test camera_capture
+          run_test -p nexo-video --test screen_capture
+
+  package-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libclang-dev libpipewire-0.3-dev libspa-0.2-dev libv4l-dev libasound2-dev libfontconfig1-dev libxkbcommon-dev libx11-dev libxext-dev libxrandr-dev libxi-dev libxcursor-dev dpkg-dev
+      - name: Build native packages
+        run: |
+          chmod +x scripts/package-linux.sh
+          scripts/package-linux.sh v1.0.0 dist-ci
+      - name: Inspect package metadata
+        run: |
+          dpkg-deb -I dist-ci/nexo_1.0.0_amd64.deb
+          dpkg-deb -f dist-ci/nexo_1.0.0_amd64.deb Depends | grep -q 'libasound2'
+          dpkg-deb -f dist-ci/nexo_1.0.0_amd64.deb Depends | grep -q 'libfontconfig1'
+          dpkg-deb -f dist-ci/nexo_1.0.0_amd64.deb Depends | grep -q 'libpipewire-0.3-0'
+          tar -tzf dist-ci/nexo-1.0.0-linux-x86_64.tar.gz
+          test -x target/release/nexo
+          ! ldd target/release/nexo | grep -q 'not found'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexo-linux-x86_64
+          path: dist-ci/*
+
+  package-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build portable package
+        shell: pwsh
+        run: .\scripts\package-windows.ps1 -Version v1.0.0 -OutDir dist-ci
+      - name: Inspect and smoke test package
+        shell: pwsh
+        run: |
+          $zip = Join-Path $PWD 'dist-ci\nexo-1.0.0-windows-x86_64.zip'
+          $extract = Join-Path $env:RUNNER_TEMP 'nexo-package'
+          Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
+          if (!(Test-Path (Join-Path $extract 'nexo.exe'))) { throw 'nexo.exe missing from package' }
+          if (!(Test-Path (Join-Path $extract 'LICENSE'))) { throw 'LICENSE missing from package' }
+          $process = Start-Process -FilePath (Join-Path $extract 'nexo.exe') -WorkingDirectory $extract -WindowStyle Hidden -PassThru
+          Start-Sleep -Seconds 5
+          if ($process.HasExited) { throw "nexo.exe exited with code $($process.ExitCode)" }
+          Stop-Process -Id $process.Id -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexo-windows-x86_64
+          path: dist-ci/nexo-1.0.0-windows-x86_64.zip

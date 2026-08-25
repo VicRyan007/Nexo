@@ -2,7 +2,9 @@ use nexo_core::CallSignal;
 use serde::{Deserialize, Serialize};
 
 pub const SIGNAL_PROTOCOL: &str = "/nexo/call-signal/0.1.0";
-pub const MAX_SIGNALS_PER_REQUEST: usize = 64;
+// Keep room for CBOR and request metadata below the 512 KiB transport cap.
+pub const MAX_SIGNALS_PER_REQUEST: usize = 12;
+const MAX_TRACKED_DEVICE_KEYS: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SignalRequest {
@@ -73,6 +75,17 @@ impl SignalRateLimiter {
 
     /// Check if a request from `device_key` is allowed and record the attempt.
     pub fn check_and_record(&mut self, device_key: &[u8; 32], now: Instant) -> bool {
+        self.prune_idle(now);
+        if !self.history.contains_key(device_key)
+            && self.history.len() >= MAX_TRACKED_DEVICE_KEYS
+            && let Some((oldest_key, _)) = self
+                .history
+                .iter()
+                .filter_map(|(key, entries)| entries.last().map(|last| (*key, *last)))
+                .min_by_key(|(_, last)| *last)
+        {
+            self.history.remove(&oldest_key);
+        }
         let entries = self.history.entry(*device_key).or_default();
         entries.retain(|t| now.duration_since(*t) <= self.window);
         if entries.len() >= self.max_requests {
@@ -114,5 +127,17 @@ mod tests {
 
         limiter.prune_idle(later + Duration::from_millis(200));
         assert!(limiter.history.is_empty());
+    }
+
+    #[test]
+    fn rate_limiter_caps_stale_device_keys() {
+        let mut limiter = SignalRateLimiter::default();
+        let now = Instant::now();
+        for index in 0..(MAX_TRACKED_DEVICE_KEYS + 8) {
+            let mut device = [0_u8; 32];
+            device[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            assert!(limiter.check_and_record(&device, now));
+        }
+        assert!(limiter.history.len() <= MAX_TRACKED_DEVICE_KEYS);
     }
 }

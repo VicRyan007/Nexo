@@ -27,11 +27,10 @@ and replicated events are untrusted even when received from a known member.
 
 - account recovery and multi-device revocation;
 - Sybil resistance for public communities;
-- MLS group key management;
+- interoperable RFC 9420 MLS key packages and external MLS interoperability;
 - malicious SFU traffic analysis and selective dropping;
 - attachment malware scanning;
 - denial-of-service quotas and proof of work;
 - secure auto-update signing.
 
 These items block a public beta but not a LAN-only engineering prototype.
-
